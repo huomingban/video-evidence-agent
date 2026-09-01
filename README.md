@@ -75,6 +75,8 @@ npm run dev
 | `/api/evidence` | GET/POST | 证据列表和创建 |
 | `/api/ask` | POST | 提问（执行 Agent 工作流） |
 | `/api/videos/upload` | POST | 上传视频（自动转录） |
+| `/api/videos` | GET | 查看已保存的视频资源 |
+| `/api/videos/{video_id}` | DELETE | 删除视频、证据和检索索引 |
 | `/api/demo/seed` | POST | 加载演示数据 |
 | `/api/metrics` | GET | 系统指标和 Agent 能力 |
 

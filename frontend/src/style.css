@@ -161,6 +161,68 @@ h2 {
   margin-bottom: 20px;
 }
 
+.video-library {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 20px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid #e3e8ec;
+}
+
+.library-heading {
+  color: #65727e;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.video-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.video-select {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #dce2e7;
+  border-radius: 6px;
+  color: #344450;
+  background: #fbfcfd;
+  text-align: left;
+}
+
+.video-select strong,
+.video-select span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.video-select span {
+  color: #73808a;
+  font-size: 12px;
+}
+
+.video-select.is-active {
+  border-color: #3478f6;
+  background: #f0f5ff;
+}
+
+.delete-button {
+  width: 38px;
+  flex: 0 0 38px;
+  border: 1px solid #f0cfcf;
+  border-radius: 6px;
+  color: #a33b3b;
+  background: #fff7f7;
+  font-size: 20px;
+  line-height: 1;
+}
+
 .question-input {
   resize: vertical;
   min-height: 124px;

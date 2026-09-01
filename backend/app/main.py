@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import hashlib
 import json
 import logging
 import math
@@ -11,6 +12,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import uuid
 from contextlib import contextmanager
 from tempfile import NamedTemporaryFile
 from typing import Any, TypedDict
@@ -159,6 +161,20 @@ def get_connection() -> sqlite3.Connection:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS videos (
+            video_id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            stored_path TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'COMPLETED',
+            transcript_text TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     return connection
 
 
@@ -177,6 +193,55 @@ def init_db() -> None:
         )
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def register_legacy_videos() -> None:
+    """Register uploads created before the videos resource table existed."""
+    if not UPLOADS_DIR.is_dir():
+        return
+    with get_connection() as connection:
+        for video_dir in UPLOADS_DIR.iterdir():
+            if not video_dir.is_dir() or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", video_dir.name):
+                continue
+            existing = connection.execute(
+                "SELECT 1 FROM videos WHERE video_id = ?", (video_dir.name,)
+            ).fetchone()
+            if existing:
+                continue
+            evidence_count = connection.execute(
+                "SELECT COUNT(*) FROM evidence WHERE video_id = ?", (video_dir.name,)
+            ).fetchone()[0]
+            candidates = [
+                path for path in video_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpeg", ".mpg"}
+            ]
+            if not candidates:
+                continue
+            path = max(candidates, key=lambda item: item.stat().st_mtime)
+            connection.execute(
+                """
+                INSERT INTO videos(video_id, filename, stored_path, content_hash, status, transcript_text)
+                VALUES (?, ?, ?, ?, 'COMPLETED', ?)
+                """,
+                (
+                    video_dir.name,
+                    path.name,
+                    str(path),
+                    file_sha256(path),
+                    "\n".join(
+                        row[0] for row in connection.execute(
+                            "SELECT text FROM evidence WHERE video_id = ? ORDER BY start_seconds, id",
+                            (video_dir.name,),
+                        ).fetchall()
+                    ) if evidence_count else None,
+                ),
+            )
 def format_timestamp(seconds: float) -> str:
     total = max(0, int(seconds))
     minutes, seconds = divmod(total, 60)
@@ -1280,6 +1345,7 @@ def validate_video_filename(filename: str) -> str:
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    register_legacy_videos()
     ensure_qdrant_collection()
 
 
@@ -1339,6 +1405,18 @@ def seed_demo(payload: DemoSeedIn) -> dict[str, Any]:
     return {"video_id": payload.video_id, "seeded": len(demo_items)}
 
 
+@app.get("/api/videos")
+def list_videos() -> dict[str, Any]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT v.video_id, v.filename, v.content_hash, v.status, v.created_at, v.updated_at, "
+            "COUNT(e.id) AS evidence_count "
+            "FROM videos v LEFT JOIN evidence e ON e.video_id = v.video_id "
+            "GROUP BY v.video_id ORDER BY v.updated_at DESC, v.video_id"
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}
+
+
 @app.post("/api/videos/upload")
 async def upload_video(
     video_id: str = Form(..., min_length=1),
@@ -1352,33 +1430,84 @@ async def upload_video(
     video_dir = UPLOADS_DIR / video_id
     video_dir.mkdir(parents=True, exist_ok=True)
     stored_path = video_dir / safe_name
+    temporary_path = video_dir / f".{uuid.uuid4().hex}.uploading"
     max_upload_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))
     total_bytes = 0
+    digest = hashlib.sha256()
     try:
-        with stored_path.open("wb") as output:
+        with temporary_path.open("wb") as output:
             while chunk := await file.read(1024 * 1024):
                 total_bytes += len(chunk)
                 if total_bytes > max_upload_bytes:
                     raise HTTPException(status_code=413, detail="video file is too large")
+                digest.update(chunk)
                 output.write(chunk)
     except Exception:
-        stored_path.unlink(missing_ok=True)
+        temporary_path.unlink(missing_ok=True)
         raise
 
+    content_hash = digest.hexdigest()
+    existing: sqlite3.Row | None = None
+    with get_connection() as connection:
+        existing = connection.execute(
+            "SELECT video_id, filename, stored_path, content_hash FROM videos WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        evidence_count = connection.execute(
+            "SELECT COUNT(*) FROM evidence WHERE video_id = ?", (video_id,)
+        ).fetchone()[0]
+    if (
+        existing is not None
+        and existing["content_hash"] == content_hash
+        and evidence_count > 0
+        and Path(existing["stored_path"]).is_file()
+    ):
+        temporary_path.unlink(missing_ok=True)
+        return {
+            "video_id": video_id,
+            "filename": existing["filename"],
+            "stored_path": existing["stored_path"],
+            "evidence_count": evidence_count,
+            "status": "already_processed",
+            "deduplicated": True,
+        }
+
     try:
-        transcript = await run_in_threadpool(extract_transcript_from_video, stored_path, safe_name)
+        transcript = await run_in_threadpool(extract_transcript_from_video, temporary_path, safe_name)
     except Exception as error:
-        stored_path.unlink(missing_ok=True)
+        temporary_path.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail=str(error)) from error
     if not transcript:
-        stored_path.unlink(missing_ok=True)
+        temporary_path.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail="no speech transcript was produced")
+
+    old_path = Path(existing["stored_path"]) if existing is not None else None
+    temporary_path.replace(stored_path)
     with get_connection() as connection:
         connection.execute("DELETE FROM evidence WHERE video_id = ?", (video_id,))
         connection.executemany(
             "INSERT INTO evidence(video_id, start_seconds, end_seconds, text) VALUES (?, ?, ?, ?)",
             [(video_id, start, end, text) for start, end, text in transcript],
         )
+        connection.execute(
+            """
+            INSERT INTO videos(video_id, filename, stored_path, content_hash, status, transcript_text)
+            VALUES (?, ?, ?, ?, 'COMPLETED', ?)
+            ON CONFLICT(video_id) DO UPDATE SET
+                filename = excluded.filename,
+                stored_path = excluded.stored_path,
+                content_hash = excluded.content_hash,
+                status = excluded.status,
+                transcript_text = excluded.transcript_text,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (video_id, safe_name, str(stored_path), content_hash, "\n".join(item[2] for item in transcript)),
+        )
+    if old_path is not None and old_path != stored_path:
+        old_path.unlink(missing_ok=True)
+    for path in video_dir.iterdir():
+        if path.is_file() and path != stored_path and not path.name.endswith(".uploading"):
+            path.unlink(missing_ok=True)
     await run_in_threadpool(sync_evidence_to_qdrant, video_id)
 
     return {
@@ -1387,6 +1516,32 @@ async def upload_video(
         "stored_path": str(stored_path),
         "evidence_count": len(transcript),
         "status": "uploaded",
+        "deduplicated": False,
+    }
+
+
+@app.delete("/api/videos/{video_id}")
+def delete_video(video_id: str) -> dict[str, Any]:
+    video_id = validate_video_id(video_id)
+    video_dir = UPLOADS_DIR / video_id
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT filename FROM videos WHERE video_id = ?", (video_id,)
+        ).fetchone()
+        evidence_count = connection.execute(
+            "SELECT COUNT(*) FROM evidence WHERE video_id = ?", (video_id,)
+        ).fetchone()[0]
+        if row is None and evidence_count == 0 and not video_dir.exists():
+            raise HTTPException(status_code=404, detail="video not found")
+        connection.execute("DELETE FROM evidence WHERE video_id = ?", (video_id,))
+        connection.execute("DELETE FROM videos WHERE video_id = ?", (video_id,))
+    shutil.rmtree(video_dir, ignore_errors=True)
+    sync_evidence_to_qdrant(video_id)
+    return {
+        "video_id": video_id,
+        "deleted": True,
+        "filename": row["filename"] if row is not None else None,
+        "evidence_count": evidence_count,
     }
 
 

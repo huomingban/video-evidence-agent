@@ -51,6 +51,14 @@ export const api = {
       body: formData,
     }, 30 * 60 * 1000, "视频上传和转录");
   },
+  listVideos() {
+    return request("/api/videos");
+  },
+  deleteVideo(videoId) {
+    return request(`/api/videos/${encodeURIComponent(videoId)}`, {
+      method: "DELETE",
+    });
+  },
   listEvidence(videoId) {
     return request(`/api/evidence?video_id=${encodeURIComponent(videoId)}`);
   },

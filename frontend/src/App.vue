@@ -5,6 +5,7 @@ import { api } from "./api";
 const videoId = ref("demo-video");
 const question = ref("");
 const evidence = ref([]);
+const videos = ref([]);
 const result = ref(null);
 const loading = ref(false);
 const loadingMessage = ref("");
@@ -29,6 +30,44 @@ async function loadEvidence() {
     evidence.value = (await api.listEvidence(videoId.value)).items;
   } catch (error) {
     message.value = error.message;
+  }
+}
+
+async function loadVideos() {
+  try {
+    videos.value = (await api.listVideos()).items;
+  } catch (error) {
+    message.value = error.message;
+  }
+}
+
+async function selectVideo(video) {
+  videoId.value = video.video_id;
+  selectedFile.value = null;
+  result.value = null;
+  await loadEvidence();
+}
+
+async function removeVideo(video) {
+  if (!window.confirm(`Delete ${video.filename}? This removes the video and its evidence.`)) return;
+  loading.value = true;
+  loadingMessage.value = "Deleting video and evidence...";
+  message.value = "";
+  try {
+    await api.deleteVideo(video.video_id);
+    await loadVideos();
+    if (videoId.value === video.video_id) {
+      videoId.value = "demo-video";
+      evidence.value = [];
+      result.value = null;
+      await loadEvidence();
+    }
+    message.value = "Video and its evidence were deleted.";
+  } catch (error) {
+    message.value = error.message;
+  } finally {
+    loading.value = false;
+    loadingMessage.value = "";
   }
 }
 
@@ -61,6 +100,7 @@ async function uploadVideo() {
   try {
     const payload = await api.uploadVideo(videoId.value, selectedFile.value);
     await loadEvidence();
+    await loadVideos();
     result.value = null;
     message.value = `已上传 ${payload.filename}，${payload.evidence_count} 条转录证据已写入。`;
   } catch (error) {
@@ -93,7 +133,10 @@ function formatSeconds(seconds) {
   return `${minutes}:${rest}`;
 }
 
-onMounted(loadEvidence);
+onMounted(async () => {
+  await loadVideos();
+  await loadEvidence();
+});
 </script>
 
 <template>
@@ -132,6 +175,17 @@ onMounted(loadEvidence);
 
         <label class="field-label" for="video-id">视频标识</label>
         <input id="video-id" v-model="videoId" class="text-input" @change="loadEvidence" />
+
+        <div v-if="videos.length" class="video-library">
+          <div class="library-heading">Saved videos</div>
+          <div v-for="video in videos" :key="video.video_id" class="video-row">
+            <button class="video-select" :class="{ 'is-active': video.video_id === videoId }" @click="selectVideo(video)">
+              <strong>{{ video.filename }}</strong>
+              <span>{{ video.evidence_count }} evidence items</span>
+            </button>
+            <button class="delete-button" :disabled="loading" title="Delete video" @click="removeVideo(video)">×</button>
+          </div>
+        </div>
 
         <div v-if="evidence.length" class="evidence-list">
           <article v-for="item in evidence" :key="item.id" class="evidence-item">

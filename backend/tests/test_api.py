@@ -22,7 +22,15 @@ def setup_function() -> None:
             "id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT NOT NULL, "
             "start_seconds REAL NOT NULL, end_seconds REAL NOT NULL, text TEXT NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS videos ("
+            "video_id TEXT PRIMARY KEY, filename TEXT NOT NULL, stored_path TEXT NOT NULL, "
+            "content_hash TEXT NOT NULL, status TEXT NOT NULL, transcript_text TEXT, "
+            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
         connection.execute("DELETE FROM evidence")
+        connection.execute("DELETE FROM videos")
 
 
 def test_health() -> None:
@@ -80,6 +88,34 @@ def test_upload_video_creates_transcript_evidence(monkeypatch) -> None:
     })
     assert response.status_code == 200
     assert response.json()['grounded'] is True
+
+
+def test_upload_deduplicates_and_delete_cleans_video(monkeypatch) -> None:
+    transcribe_calls = []
+
+    def fake_transcribe(video_path, file_name):
+        transcribe_calls.append(video_path)
+        return [(0.0, 2.0, "deduplicated upload evidence")]
+
+    monkeypatch.setattr(main, "extract_transcript_from_video", fake_transcribe)
+    payload = {
+        "video_id": "managed-video",
+        "file": ("managed.mp4", b"same video bytes", "video/mp4"),
+    }
+    first = client.post("/api/videos/upload", data={"video_id": payload["video_id"]}, files={"file": payload["file"]})
+    second = client.post("/api/videos/upload", data={"video_id": payload["video_id"]}, files={"file": payload["file"]})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["deduplicated"] is True
+    assert len(transcribe_calls) == 1
+    assert client.get("/api/videos").json()["items"][0]["video_id"] == "managed-video"
+
+    deleted = client.delete("/api/videos/managed-video")
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert client.get("/api/videos").json()["items"] == []
+    assert client.get("/api/evidence", params={"video_id": "managed-video"}).json()["items"] == []
 
 
 def test_kimi_answer_validates_citations(monkeypatch) -> None:
