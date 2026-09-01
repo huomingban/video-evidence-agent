@@ -7,7 +7,7 @@
 ## ✨ 核心特性
 
 - **多策略检索**：语义检索（Qdrant + SentenceTransformers）+ 关键词检索的混合方案
-- **LangGraph Agent**：Retrieve → Verify → Answer 的工作流，支持条件路由和拒答保护
+- **结构化 LangGraph Agent**：Planner → Retriever → Verifier → Writer → Critic 工作流，支持条件路由、受限修订和拒答保护
 - **工具调用系统**：显式工具调用（semantic_search, keyword_search, verify_coverage）并追踪
 - **自动转录**：FFmpeg + faster-whisper 实时将视频转换成带时间戳的证据
 - **决策链可视化**：前端展示 Agent 每一步的思考过程和工具调用
@@ -163,34 +163,39 @@ curl http://127.0.0.1:9090/api/metrics | jq
 ```
 用户提问
   ↓
-[Retrieve Node]
-  ├─ Tool: semantic_search (Qdrant 向量相似度)
-  ├─ Tool: keyword_search (关键词匹配)
-  └─ 返回 top-3 证据
+[Planner Node]
+  ├─ 理解问题意图
+  └─ 拆分必须验证的证据需求
   ↓
-[Verify Node]
-  ├─ Tool: verify_coverage (检查证据覆盖度)
-  ├─ IF 证据不足 → END (拒答)
-  └─ IF 证据充分 → 继续
+[Retriever Node]
+  ├─ 按证据需求检索 ASR/OCR 时间轴
+  └─ 建立 Evidence Ledger（证据台账）
   ↓
-[Answer Node]
-  ├─ 基于证据生成答案
-  ├─ 附加时间戳引用
-  └─ 返回带 trace 的结果
+[Verifier Node]
+  ├─ 逐个证据槽位验证支持关系
+  └─ 判断证据是否充分、是否需要拒答
   ↓
-返回给用户（包含决策链可视化）
+[Writer Node]
+  └─ 只使用通过验证的 evidenceId 生成报告
+  ↓
+[Critic Node]
+  ├─ 检查完整性、矛盾、外部知识和引用
+  └─ 未通过时回到 Retriever 补充证据，再经过 Verifier 和 Writer 修订一次
+  ↓
+返回给用户（包含 Agent 图、证据台账和引用）
 ```
 
 ## 与参考项目的对应关系
 
-当前项目是参考项目的轻量本地版，概念对应如下：
+当前项目已对齐参考项目的核心 Agent 结构，概念对应如下：
 
 | 参考项目概念 | 当前项目实现 | 说明 |
 |---|---|---|
 | `Media` | `videos` SQLite 表 + `data/uploads/` | 保存视频资源、哈希、文件路径和转录状态 |
 | `EvidenceSegment` | `evidence` SQLite 表 | 保存带开始/结束时间的转录证据 |
 | `AgentToolbox` | `backend/seeit/agent.py` 中的 `AgentToolbox` | 提供元数据、时间轴检索、证据窗口和报告工具 |
-| `agent_graph` | `backend/seeit/agent.py` + `agent_graph.py` | Kimi 可选择工具；未配置 Kimi 时使用 LangGraph 固定流程 |
+| `agent_structured` | `backend/seeit/agent_structured.py` | 完整 Planner → Retriever → Verifier → Writer → Critic 工作流，使用 Evidence Ledger 和 Critic 质量门禁 |
+| `agent_graph` | `backend/seeit/agent_graph.py` | 保留旧版 Retrieve → Verify → Answer 兼容流程 |
 | `generate_report` | Agent 工具的结构化报告提交 | 后端校验引用 ID 和证据覆盖后才接受 |
 | Qdrant 检索 | `backend/seeit/qdrant_retrieval.py` + `retrieval.py` | 向量不可用时自动降级为关键词检索 |
 | Agent 会话记忆 | 已启用 | SQLite 持久化会话、消息、结构化报告和工具轨迹；最近消息可按配置注入 Kimi |
@@ -230,7 +235,8 @@ video-evidence-agent/
 │   │   ├── main.py              # ASGI 入口
 │   │   ├── api.py               # FastAPI 路由和应用组装
 │   │   ├── agent.py             # AgentToolbox、Kimi 和引用校验
-│   │   ├── agent_graph.py       # LangGraph fallback 工作流
+│   │   ├── agent_graph.py       # 旧版 LangGraph 兼容工作流
+│   │   ├── agent_structured.py # Planner -> Retriever -> Verifier -> Writer -> Critic
 │   │   ├── retrieval.py         # 关键词、向量和 Qdrant 检索
 │   │   ├── embedding_retrieval.py # Embedding 后端边界
 │   │   ├── qdrant_retrieval.py  # Qdrant 存储边界

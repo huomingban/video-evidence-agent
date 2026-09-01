@@ -1,5 +1,6 @@
 """LangGraph workflow for the deterministic local Agent fallback."""
 from __future__ import annotations
+import re
 from typing import Any, TypedDict
 try:
     from langgraph.graph import END, START, StateGraph
@@ -7,6 +8,25 @@ except Exception:
     END = START = StateGraph = None
 from .models import Evidence
 from .agent import answer_from_evidence, search_keyword_tool, search_semantic_tool, verify_coverage_tool
+
+
+def extract_goal_timestamps_ms(goal: str) -> list[int]:
+    """Extract explicit mm:ss or second-based anchors from a user question."""
+    candidates: list[tuple[int, int]] = []
+    occupied: list[tuple[int, int]] = []
+
+    def add(match: Any, milliseconds: int) -> None:
+        start, end = match.span()
+        if milliseconds < 0 or any(start < right and end > left for left, right in occupied):
+            return
+        occupied.append((start, end))
+        candidates.append((start, milliseconds))
+
+    for match in re.finditer(r"(?<!\d)(\d{1,3}):(\d{2})(?!\d)", goal):
+        add(match, (int(match.group(1)) * 60 + int(match.group(2))) * 1000)
+    for match in re.finditer(r"(\d+(?:\.\d+)?)\s*(?:秒|s)\b", goal, flags=re.I):
+        add(match, int(float(match.group(1)) * 1000))
+    return [value for _, value in sorted(candidates)][:5]
 
 class AgentState(TypedDict):
     question: str

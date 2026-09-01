@@ -5,6 +5,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from seeit.api import DB_PATH, app
+from seeit.agent import AgentToolbox
+from seeit.agent_structured import run_structured_evidence_agent
 
 
 client = TestClient(app)
@@ -13,6 +15,7 @@ client = TestClient(app)
 @pytest.fixture(autouse=True)
 def disable_external_kimi(monkeypatch) -> None:
     monkeypatch.setenv("KIMI_ENABLED", "false")
+    monkeypatch.setenv("KIMI_AGENT_WORKFLOW", "legacy")
 
 
 def setup_function() -> None:
@@ -367,6 +370,116 @@ def test_kimi_session_history_is_opt_in(monkeypatch) -> None:
         {"role": "assistant", "content": "The speaker introduced project learning."},
     ]
     assert "What is project learning?" in messages[-1]["content"]
+
+
+def test_structured_agent_runs_planner_retriever_verifier_writer_critic() -> None:
+    response = client.post(
+        "/api/evidence",
+        json={
+            "video_id": "structured-agent-test",
+            "start_seconds": 0,
+            "end_seconds": 5,
+            "text": "The project uses retrieval and verification.",
+        },
+    )
+    assert response.status_code == 200
+    evidence_id = response.json()["id"]
+
+    class FakeProvider:
+        def _completion(self, messages, tools, tool_choice=None):
+            import json
+
+            phase = getattr(self, "_agent_phase", "")
+            if phase == "PLANNER":
+                name = "submit_evidence_plan"
+                arguments = {
+                    "answerMode": "SINGLE",
+                    "requirements": [{
+                        "requirementId": "R1",
+                        "subQuestion": "What method does the project use?",
+                        "retrievalQuery": "project retrieval verification",
+                        "evidenceRole": "DIRECT",
+                        "completionPolicy": "DIRECT",
+                        "expectedSources": ["ASR"],
+                        "required": True,
+                    }],
+                }
+            elif phase == "VERIFIER":
+                name = "submit_evidence_verification"
+                arguments = {
+                    "requirements": [{
+                        "requirementId": "R1",
+                        "supported": True,
+                        "complete": True,
+                        "supportLevel": "DIRECT",
+                        "evidenceIds": ["E001"],
+                        "missingInformation": "",
+                        "contradictionEvidenceIds": [],
+                    }],
+                    "overallSufficient": True,
+                    "shouldRefuse": False,
+                    "refusalReason": "",
+                }
+            elif phase == "WRITER":
+                name = "submit_grounded_report"
+                arguments = {
+                    "answerable": True,
+                    "finalAnswer": "The project uses retrieval and verification.",
+                    "title": "Project report",
+                    "conclusions": ["The project uses retrieval and verification."],
+                    "evidenceIds": ["E001"],
+                    "suggestions": [],
+                }
+            else:
+                name = "submit_critic_review"
+                arguments = {
+                    "approved": True,
+                    "answerabilityCorrect": True,
+                    "allRequiredSlotsCovered": True,
+                    "contradictionFree": True,
+                    "externalKnowledgeFree": True,
+                    "citationIdsValid": True,
+                    "missingRequirementIds": [],
+                    "unsupportedClaims": [],
+                    "contradictions": [],
+                    "revisionInstruction": "",
+                }
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": name,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments),
+                    },
+                }],
+            }
+
+    toolbox = AgentToolbox(
+        "structured-agent-test",
+        "What method does the project use?",
+    )
+    result = run_structured_evidence_agent(
+        FakeProvider(),
+        toolbox,
+        "What method does the project use?",
+    )
+
+    assert result["accepted"] is True
+    assert result["final_answer"] == "The project uses retrieval and verification."
+    assert result["citations"][0]["evidence_id"] == evidence_id
+    assert result["agentGraph"]["nodes"] == [
+        "structured_planner",
+        "retrieve_evidence_slots",
+        "verify_evidence_ledger",
+        "write_grounded_report",
+        "critic_review",
+        "retrieve_followup_evidence",
+        "verify_followup_evidence",
+        "revise_report",
+    ]
 
 
 def test_metrics_endpoint() -> None:

@@ -18,6 +18,62 @@ from .retrieval import format_timestamp, load_video_evidence, public_evidence, s
 from .runtime_retrieval import build_runtime_retriever
 from .storage import get_connection
 
+
+def is_summary_goal(goal: str) -> bool:
+    normalized = re.sub(r"\s+", "", str(goal)).lower()
+    return bool(re.search(
+        r"总结|概括|综述|梳理|核心内容|主要内容|关键观点|学习笔记|视频摘要|summari[sz]e|overview",
+        normalized,
+    ))
+
+
+def build_agent_plan(goal: str) -> dict[str, Any]:
+    """Return the human-readable intent plan shown in Agent traces."""
+    normalized = " ".join(str(goal).split())
+    if is_summary_goal(normalized):
+        intent = "STRUCTURED_SUMMARY"
+        tasks = [
+            "读取视频元数据并确定总结范围",
+            "抽取时间轴上具有代表性的 ASR/OCR 证据",
+            "综合主题、观点和示例生成结构化摘要",
+            "校验结论与时间戳证据",
+        ]
+    elif re.search(r"会议|决策|待办|负责人|风险", normalized):
+        intent = "MEETING_REVIEW"
+        tasks = [
+            "识别会议分析范围",
+            "检索决策、待办、负责人和风险证据",
+            "展开关键证据窗口",
+            "校验每条结论的时间戳引用",
+        ]
+    elif re.search(r"步骤|操作|教程|流程|怎么做|如何(?:操作|完成|实现|使用|配置|部署)", normalized):
+        intent = "OPERATION_GUIDE"
+        tasks = [
+            "识别操作目标",
+            "检索步骤、界面动作和前后依赖",
+            "展开关键证据窗口并按顺序组织",
+            "校验步骤引用和时间戳",
+        ]
+    else:
+        intent = "EVIDENCE_QA"
+        tasks = [
+            "理解问题中的主体、关系和答案范围",
+            "检索最相关的 ASR/OCR 时间轴证据",
+            "展开命中片段前后的上下文",
+            "校验回答是否完全由视频证据支持",
+        ]
+    return {
+        "understoodGoal": normalized,
+        "intent": intent,
+        "tasks": tasks,
+        "steps": [
+            {"stage": "CONTEXT", "tools": ["get_video_metadata"]},
+            {"stage": "RETRIEVAL", "tools": ["search_timeline", "get_evidence_window"]},
+            {"stage": "CRITIC", "tools": ["verify_citations", "generate_report"]},
+        ],
+    }
+
+
 class AgentToolbox:
     """Tools the model may choose while investigating one video."""
 
@@ -170,6 +226,38 @@ class AgentToolbox:
             },
         ]
 
+    # Reference-project naming. Keeping this alias makes the structured
+    # Planner/Retriever/Verifier/Writer/Critic pipeline independently usable.
+    def tool_schemas(self) -> list[dict[str, Any]]:
+        return self.schemas()
+
+    def prefetch_goal_evidence(self, goal: str, top_k: int = 8) -> dict[str, Any]:
+        result = self._search({"query": goal, "top_k": top_k})
+        matches = result.get("matches", [])
+        return {
+            **result,
+            "coveragePlan": {
+                "strategy": "HYBRID_RETRIEVAL",
+                "query": goal,
+                "requirementCount": 1,
+            },
+            "evidenceSufficiency": {
+                "decision": "SUFFICIENT_CANDIDATES" if matches else "INSUFFICIENT_EVIDENCE",
+                "fullyCovered": bool(matches),
+                "requirements": [{
+                    "requirementId": "R1",
+                    "satisfied": bool(matches),
+                    "candidateEvidenceIds": [
+                        str(item.get("evidence_id", item.get("evidenceId")))
+                        for item in matches
+                    ],
+                }],
+            },
+        }
+
+    def goal_evidence_sufficiency(self) -> dict[str, Any] | None:
+        return None
+
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
             if name == "get_video_metadata":
@@ -216,7 +304,11 @@ class AgentToolbox:
     def _overview(self, arguments: dict[str, Any]) -> dict[str, Any]:
         count = max(4, min(int(arguments.get("max_segments", 12)), 20))
         selected = self._evenly_spaced(self.evidence, count)
-        return {"ok": True, "sampling": "even_timeline", "segments": [public_evidence(item) for item in selected]}
+        return {
+            "ok": True,
+            "sampling": "even_timeline",
+            "segments": [self._structured_evidence(item) for item in selected],
+        }
 
     def _search(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or self.question).strip()
@@ -224,7 +316,11 @@ class AgentToolbox:
             raise ValueError("query 不能为空")
         count = max(1, min(int(arguments.get("top_k", 6)), 10))
         matches = self.retriever(query, count)
-        return {"ok": True, "query": query, "matches": [public_evidence(item) for item in matches]}
+        return {
+            "ok": True,
+            "query": query,
+            "matches": [self._structured_evidence(item) for item in matches],
+        }
 
     def _window(self, arguments: dict[str, Any]) -> dict[str, Any]:
         timestamp = max(0, int(arguments["timestamp_ms"]))
@@ -239,19 +335,43 @@ class AgentToolbox:
             "ok": True,
             "window_start_ms": max(0, start),
             "window_end_ms": end,
-            "segments": [public_evidence(item) for item in matches],
+            "segments": [self._structured_evidence(item) for item in matches],
         }
 
+    @staticmethod
+    def _structured_evidence(item: Evidence) -> dict[str, Any]:
+        """Expose both legacy snake_case and reference-style fields."""
+        result = public_evidence(item)
+        result.update({
+            "evidenceId": str(item.id),
+            "segmentId": f"evidence-{item.id}",
+            "startMs": round(item.start_seconds * 1000),
+            "endMs": round(item.end_seconds * 1000),
+            "content": item.text,
+        })
+        return result
+
     def _ids(self, arguments: dict[str, Any]) -> list[int]:
-        raw_ids = arguments.get("citation_ids", [])
+        raw_ids = (
+            arguments.get("citation_ids")
+            or arguments.get("evidenceIds")
+            or arguments.get("citations")
+            or arguments.get("evidence")
+            or []
+        )
         if not isinstance(raw_ids, list):
             return []
         ids = []
         for value in raw_ids:
             if isinstance(value, dict):
-                value = value.get("evidence_id", value.get("id"))
+                value = value.get(
+                    "dbEvidenceId",
+                    value.get("evidence_id", value.get("evidenceId", value.get("id"))),
+                )
             if isinstance(value, int) and value not in ids:
                 ids.append(value)
+            elif isinstance(value, str) and value.isdigit() and int(value) not in ids:
+                ids.append(int(value))
         return ids
 
     def _verify(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -268,7 +388,9 @@ class AgentToolbox:
 
     def _report(self, arguments: dict[str, Any]) -> dict[str, Any]:
         answerable = bool(arguments.get("answerable"))
-        final_answer = str(arguments.get("final_answer") or "").strip()
+        final_answer = str(
+            arguments.get("final_answer") or arguments.get("finalAnswer") or ""
+        ).strip()
         ids = self._ids(arguments)
         by_id = {item.id: item for item in self.evidence}
         selected = [by_id[item_id] for item_id in ids if item_id in by_id]
@@ -292,7 +414,7 @@ class AgentToolbox:
             "answerable": answerable,
             "final_answer": final_answer,
             "support_level": str(arguments.get("support_level") or ("DIRECT" if answerable else "INSUFFICIENT")),
-            "citations": [public_evidence(item) for item in selected],
+            "citations": [self._structured_evidence(item) for item in selected],
         }
 
 def search_semantic_tool(question: str, video_id: str | None) -> list[Evidence]:
@@ -651,3 +773,117 @@ def answer_from_evidence(question: str, evidence: list[Evidence]) -> dict[str, A
 def kimi_is_configured() -> bool:
     settings = kimi_settings()
     return bool(OpenAI is not None and settings["enabled"] and settings["api_key"])
+
+
+class KimiStructuredProvider:
+    """Small OpenAI-compatible adapter used by the structured LangGraph."""
+
+    def __init__(self) -> None:
+        if OpenAI is None:
+            raise RuntimeError("openai package is not installed")
+        settings = kimi_settings()
+        http_client = None
+        if httpx2 is not None:
+            http_client = httpx2.Client(
+                trust_env=settings["trust_env"],
+                proxy=settings["proxy"],
+                timeout=settings["timeout"],
+            )
+        self._client = OpenAI(
+            api_key=settings["api_key"],
+            base_url=settings["base_url"],
+            timeout=settings["timeout"],
+            max_retries=1,
+            http_client=http_client,
+        )
+        self._settings = settings
+
+    @staticmethod
+    def _message_dict(message: Any) -> dict[str, Any]:
+        calls = []
+        for call in list(_message_value(message, "tool_calls", []) or []):
+            calls.append({
+                "id": str(_tool_call_value(call, "id", "tool-call")),
+                "type": "function",
+                "function": {
+                    "name": str(_function_value(call, "name", "")),
+                    "arguments": str(_function_value(call, "arguments", "{}")),
+                },
+            })
+        return {
+            "role": "assistant",
+            "content": _message_value(message, "content"),
+            "tool_calls": calls,
+        }
+
+    def _completion(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_choice: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "model": self._settings["model"],
+            "temperature": 0.1,
+            "messages": messages,
+            "tools": tools,
+        }
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        response = self._client.chat.completions.create(**kwargs)
+        return self._message_dict(response.choices[0].message)
+
+
+def run_structured_kimi_agent(
+    question: str,
+    video_id: str | None,
+) -> dict[str, Any] | None:
+    """Run the reference-style five-stage Agent when explicitly enabled."""
+    if not kimi_is_configured():
+        return None
+    try:
+        from .agent_structured import run_structured_evidence_agent
+
+        provider = KimiStructuredProvider()
+        toolbox = AgentToolbox(video_id, question)
+        result = run_structured_evidence_agent(provider, toolbox, question)
+        report = result.get("report") or result
+        report_answer = report.get("finalAnswer") or report.get("final_answer")
+        report_answerable = report.get("answerable", result.get("answerable", False))
+        report_evidence = report.get("evidence", result.get("citations", []))
+        return {
+            "question": question,
+            "answer": str(report_answer or result.get("answer") or ""),
+            "grounded": bool(report_answerable),
+            "citations": [
+                {
+                    "evidence_id": int(item.get(
+                        "dbEvidenceId",
+                        item.get("evidence_id", item.get("id", 0)),
+                    ) or 0),
+                    "timestamp": (
+                        format_timestamp(float(item.get("timestampMs", item.get("startMs", 0))) / 1000)
+                        if "timestampMs" in item or "startMs" in item else
+                        str(item.get("timestamp", ""))
+                    ),
+                    "text": item.get("content", ""),
+                    "source": item.get("source", "ASR"),
+                }
+                for item in report_evidence
+                if int(item.get(
+                    "dbEvidenceId",
+                    item.get("evidence_id", item.get("id", 0)),
+                ) or 0) > 0
+            ],
+            "provider": "Kimi structured Agent",
+            "support_level": "DIRECT" if report_answerable else "INSUFFICIENT",
+            "agent_graph": result.get("agentGraph"),
+            "trace": [
+                f"Node: {node}"
+                for node in (result.get("agentGraph") or {}).get("nodes", [])
+            ],
+            "tool_trace": toolbox.trace(),
+        }
+    except Exception:
+        logger.exception("Structured Kimi Agent execution failed")
+        return None

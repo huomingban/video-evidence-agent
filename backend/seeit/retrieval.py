@@ -236,6 +236,38 @@ def search_evidence(question: str, video_id: str | None, limit: int = 5) -> list
             seen_ids.add(item.id)
     return combined[:limit]
 
+
+def plan_evidence_requirements(query: str) -> dict[str, Any]:
+    """Create a deterministic evidence-slot plan before model verification.
+
+    The reference project uses this boundary to separate question
+    decomposition from retrieval. The local implementation intentionally
+    stays provider-independent and supplies conservative query slots.
+    """
+    normalized = " ".join(str(query).split()).strip()
+    if not normalized:
+        return {"strategy": "SINGLE_QUERY", "requirements": []}
+
+    parts = [
+        item.strip(" ，,、；;。！？!?")
+        for item in re.split(r"\s*(?:以及|并且|同时|分别|和|与|及|以及|以及|以及|以及|以及|以及|and|also)\s*", normalized, flags=re.I)
+        if item.strip(" ，,、；;。！？!?")
+    ]
+    if not parts:
+        parts = [normalized]
+    if len(parts) > 4:
+        parts = parts[:4]
+
+    strategy = "SINGLE_QUERY"
+    if len(parts) > 1:
+        strategy = "MULTI_REQUIREMENT"
+    if re.search(r"比较|区别|不同|对比|versus|vs\.?", normalized, flags=re.I):
+        strategy = "COMPARISON_DECOMPOSITION"
+    return {
+        "strategy": strategy,
+        "requirements": [{"query": part} for part in parts],
+    }
+
 def public_evidence(item: Evidence) -> dict[str, Any]:
     """Return the small, stable evidence shape exposed to the model."""
     return {

@@ -11,7 +11,13 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 from . import agent as agent_module
-from .agent import answer_from_evidence, evidence_citations, kimi_settings, parse_kimi_json
+from .agent import (
+    answer_from_evidence,
+    evidence_citations,
+    kimi_settings,
+    parse_kimi_json,
+    run_structured_kimi_agent as _run_structured_kimi_agent,
+)
 from .agent_graph import AGENT_GRAPH, AGENT_TOOL_NAMES
 from .config import env_flag, logger
 from . import ocr_runner
@@ -31,6 +37,13 @@ def kimi_is_configured() -> bool:
 
 def run_kimi_agent(question: str, video_id: str | None, history: list[dict[str, str]] | None = None) -> dict[str, Any] | None:
     agent_module.OpenAI = OpenAI
+    if os.getenv("KIMI_AGENT_WORKFLOW", "structured").strip().lower() in {
+        "structured",
+        "planner-retriever-verifier-writer-critic",
+    }:
+        structured_result = _run_structured_kimi_agent(question, video_id)
+        if structured_result is not None:
+            return structured_result
     return agent_module.run_kimi_agent(question, video_id, history=history)
 
 app = FastAPI(title="VideoEvidence Agent", version="0.4.0")
@@ -388,7 +401,7 @@ def get_metrics() -> dict[str, Any]:
     embedding_enabled = env_flag("EMBEDDING_ENABLED", False)
     
     return {
-        "agent_version": "0.3.0",
+        "agent_version": "0.5.0",
         "capabilities": [
             "vector_retrieval",
             "keyword_retrieval",
@@ -397,6 +410,8 @@ def get_metrics() -> dict[str, Any]:
             "citation_tracking",
             "agent_tracing",
             "tool_calling",
+            "structured_planning",
+            "critic_revision",
         ],
         "statistics": {
             "total_evidence": total_evidence,
@@ -407,6 +422,7 @@ def get_metrics() -> dict[str, Any]:
             "vector_database": "qdrant" if qdrant_active and embedding_enabled else "disabled",
             "embedding_model": embedding_model if embedding_enabled else "disabled",
             "agent_framework": "langgraph" if AGENT_GRAPH is not None else "fallback",
+            "agent_workflow": os.getenv("KIMI_AGENT_WORKFLOW", "structured"),
             "transcription": "faster-whisper" if ocr_runner._WHISPER_MODEL is not None else "available on upload",
             "video_processing": "ffmpeg" if resolve_ffmpeg_path() else "unavailable",
             "llm": {
