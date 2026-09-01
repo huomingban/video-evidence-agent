@@ -59,13 +59,16 @@ export const api = {
       method: "DELETE",
     });
   },
+  getVideoMemory(videoId) {
+    return request(`/api/videos/${encodeURIComponent(videoId)}/memory`);
+  },
   listEvidence(videoId) {
     return request(`/api/evidence?video_id=${encodeURIComponent(videoId)}`);
   },
-  ask(question, videoId) {
+  ask(question, videoId, sessionId) {
     return request("/api/ask", {
       method: "POST",
-      body: JSON.stringify({ question, video_id: videoId }),
+      body: JSON.stringify({ question, video_id: videoId, session_id: sessionId || undefined }),
     });
   },
 };

@@ -7,3 +7,4 @@ data/
 reference/
 node_modules/
 dist/
+backend/app/_legacy_main.py

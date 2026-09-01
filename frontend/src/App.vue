@@ -6,6 +6,8 @@ const videoId = ref("demo-video");
 const question = ref("");
 const evidence = ref([]);
 const videos = ref([]);
+const sessionId = ref(null);
+const conversation = ref([]);
 const result = ref(null);
 const loading = ref(false);
 const loadingMessage = ref("");
@@ -41,11 +43,23 @@ async function loadVideos() {
   }
 }
 
+async function loadMemory() {
+  try {
+    const memory = await api.getVideoMemory(videoId.value);
+    const session = memory.sessions?.[0];
+    sessionId.value = session?.session_id || null;
+    conversation.value = session?.messages || [];
+  } catch (error) {
+    message.value = error.message;
+  }
+}
+
 async function selectVideo(video) {
   videoId.value = video.video_id;
   selectedFile.value = null;
   result.value = null;
   await loadEvidence();
+  await loadMemory();
 }
 
 async function removeVideo(video) {
@@ -61,6 +75,8 @@ async function removeVideo(video) {
       evidence.value = [];
       result.value = null;
       await loadEvidence();
+      sessionId.value = null;
+      conversation.value = [];
     }
     message.value = "Video and its evidence were deleted.";
   } catch (error) {
@@ -117,7 +133,9 @@ async function ask() {
   loadingMessage.value = "正在检索证据并请求 Kimi...";
   message.value = "";
   try {
-    result.value = await api.ask(question.value.trim(), videoId.value);
+    result.value = await api.ask(question.value.trim(), videoId.value, sessionId.value);
+    sessionId.value = result.value.session_id || sessionId.value;
+    await loadMemory();
   } catch (error) {
     message.value = error.message;
   } finally {
@@ -136,6 +154,7 @@ function formatSeconds(seconds) {
 onMounted(async () => {
   await loadVideos();
   await loadEvidence();
+  await loadMemory();
 });
 </script>
 
@@ -226,6 +245,14 @@ onMounted(async () => {
 
         <p v-if="loadingMessage" class="notice progress-notice">{{ loadingMessage }}</p>
         <p v-if="message" class="notice">{{ message }}</p>
+
+        <div v-if="conversation.length" class="conversation-section">
+          <div class="conversation-heading">Session memory</div>
+          <div v-for="(item, index) in conversation" :key="`${item.created_at}-${index}`" class="conversation-item">
+            <span>{{ item.role === "user" ? "You" : "Agent" }}</span>
+            <p>{{ item.content }}</p>
+          </div>
+        </div>
 
         <div v-if="result" class="result">
           <p class="answer">{{ result.answer }}</p>
