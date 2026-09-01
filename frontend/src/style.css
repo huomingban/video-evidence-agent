@@ -129,6 +129,15 @@ h2 {
   box-shadow: 0 0 0 4px #e6f5ef;
 }
 
+.status-dot.is-demo {
+  background: #2c9b73;
+}
+
+.status-dot.is-uploaded {
+  background: #3478f6;
+  box-shadow: 0 0 0 4px #e8f0ff;
+}
+
 .field-label {
   display: block;
   margin-bottom: 7px;
@@ -296,6 +305,10 @@ h2 {
 .notice {
   margin: 18px 0 0;
   color: #9a5f12;
+}
+
+.progress-notice {
+  color: #1769e0;
 }
 
 .trace-section {

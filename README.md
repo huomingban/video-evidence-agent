@@ -41,9 +41,19 @@
 ```powershell
 cd backend
 pip install -r requirements.txt
-python -m pytest -q              # 运行测试（7 个测试）
+Copy-Item .env.example .env
+# 编辑 .env，填写 KIMI_API_KEY 和 KIMI_MODEL
+python -m pytest -q              # 运行测试（9 个测试，不调用真实 Kimi）
 uvicorn app.main:app --reload --port 9090
 ```
+
+Kimi 配置保存在 `backend/.env`，后端启动时会自动读取，不需要每次重新输入。`.env` 已加入 Git 忽略规则，不能提交真实 API Key。默认使用 Kimi 的 OpenAI 兼容地址 `https://api.moonshot.cn/v1`；`KIMI_MODEL` 请填写你的 Kimi 账户当前可用的模型名称。
+
+程序默认不读取系统 HTTP 代理（`KIMI_TRUST_ENV=false`），适合本机存在失效代理配置的情况。如果你的网络必须经过代理，请在 `.env` 中设置 `KIMI_TRUST_ENV=true`，或填写 `KIMI_PROXY=http://代理地址:端口`。
+
+未填写 `KIMI_API_KEY` 时，系统仍可使用本地检索和模板回退回答；填写后 `/api/ask` 会调用 Kimi，并校验返回的引用只能来自检索到的证据。
+
+上传视频时，系统会先用 FFmpeg 抽取音频，再由 faster-whisper 转写。视频没有可识别语音、文件损坏或转写失败时，接口会返回明确错误，不会写入伪造证据。
 
 打开 http://127.0.0.1:9090/docs 查看 API 文档。
 
@@ -72,7 +82,7 @@ npm run dev
 
 ```powershell
 cd backend
-pytest -q                        # 7 个测试通过
+pytest -q                        # 9 个测试通过，不调用真实 Kimi
 pytest -v                        # 详细输出
 pytest tests/test_api.py::test_ask_includes_trace -v  # 单个测试
 ```

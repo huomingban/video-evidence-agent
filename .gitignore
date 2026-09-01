@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .env
-data/*.sqlite3
+data/
+reference/
 node_modules/
 dist/

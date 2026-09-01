@@ -7,8 +7,22 @@ const question = ref("");
 const evidence = ref([]);
 const result = ref(null);
 const loading = ref(false);
+const loadingMessage = ref("");
 const message = ref("");
 const selectedFile = ref(null);
+
+function handleFileChange(event) {
+  const file = event.target.files?.[0] || null;
+  selectedFile.value = file;
+  if (file && videoId.value === "demo-video") {
+    videoId.value = file.name
+      .replace(/\.[^/.]+$/, "")
+      .replace(/[^a-zA-Z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 180) || "uploaded-video";
+    loadEvidence();
+  }
+}
 
 async function loadEvidence() {
   try {
@@ -20,6 +34,7 @@ async function loadEvidence() {
 
 async function seedDemo() {
   loading.value = true;
+  loadingMessage.value = "正在准备演示证据...";
   message.value = "";
   try {
     await api.seedDemo(videoId.value);
@@ -30,6 +45,7 @@ async function seedDemo() {
     message.value = error.message;
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
   }
 }
 
@@ -40,6 +56,7 @@ async function uploadVideo() {
   }
 
   loading.value = true;
+  loadingMessage.value = "正在上传并转录视频，首次加载语音模型可能需要较长时间...";
   message.value = "";
   try {
     const payload = await api.uploadVideo(videoId.value, selectedFile.value);
@@ -50,12 +67,14 @@ async function uploadVideo() {
     message.value = error.message;
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
   }
 }
 
 async function ask() {
   if (!question.value.trim()) return;
   loading.value = true;
+  loadingMessage.value = "正在检索证据并请求 Kimi...";
   message.value = "";
   try {
     result.value = await api.ask(question.value.trim(), videoId.value);
@@ -63,6 +82,7 @@ async function ask() {
     message.value = error.message;
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
   }
 }
 
@@ -85,7 +105,7 @@ onMounted(loadEvidence);
       </div>
       <div class="header-actions">
         <label class="upload-button">
-          <input type="file" accept="video/*" @change="(event) => selectedFile = event.target.files?.[0] || null" />
+          <input type="file" accept="video/*" @change="handleFileChange" />
           选择视频
         </label>
         <button class="secondary-button" :disabled="loading || !selectedFile" @click="uploadVideo">
@@ -104,7 +124,10 @@ onMounted(loadEvidence);
             <span class="section-label">证据时间轴</span>
             <h2>{{ evidence.length }} 条证据</h2>
           </div>
-          <span class="status-dot" title="当前为本地演示数据"></span>
+          <span
+            :class="['status-dot', videoId === 'demo-video' ? 'is-demo' : 'is-uploaded']"
+            :title="videoId === 'demo-video' ? '当前为演示数据' : '当前为上传视频数据'"
+          ></span>
         </div>
 
         <label class="field-label" for="video-id">视频标识</label>
@@ -118,7 +141,7 @@ onMounted(loadEvidence);
             <p>{{ item.text }}</p>
           </article>
         </div>
-        <p v-else class="empty-state">还没有证据。点击右上角准备一组演示数据。</p>
+        <p v-else class="empty-state">还没有证据。请先选择视频并上传转录，或准备演示数据。</p>
       </aside>
 
       <section class="answer-panel">
@@ -147,6 +170,7 @@ onMounted(loadEvidence);
           </button>
         </form>
 
+        <p v-if="loadingMessage" class="notice progress-notice">{{ loadingMessage }}</p>
         <p v-if="message" class="notice">{{ message }}</p>
 
         <div v-if="result" class="result">

@@ -1,9 +1,18 @@
+from types import SimpleNamespace
+
+import app.main as main
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import DB_PATH, app
 
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def disable_external_kimi(monkeypatch) -> None:
+    monkeypatch.setenv("KIMI_ENABLED", "false")
 
 
 def setup_function() -> None:
@@ -49,7 +58,12 @@ def test_unknown_question_refuses() -> None:
     assert response.status_code == 200
     assert response.json()["grounded"] is False
 
-def test_upload_video_creates_transcript_evidence() -> None:
+def test_upload_video_creates_transcript_evidence(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main,
+        "extract_transcript_from_video",
+        lambda video_path, file_name: [(0.0, 2.0, "视频处理流程测试")],
+    )
     response = client.post(
         '/api/videos/upload',
         data={'video_id': 'uploaded-demo'},
@@ -66,6 +80,127 @@ def test_upload_video_creates_transcript_evidence() -> None:
     })
     assert response.status_code == 200
     assert response.json()['grounded'] is True
+
+
+def test_kimi_answer_validates_citations(monkeypatch) -> None:
+    cited_evidence_id = 0
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=f'{{"answer":"项目式学习先做项目再补齐知识。","citation_ids":[{cited_evidence_id}]}}'
+                        )
+                    )
+                ]
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setenv("KIMI_API_KEY", "test-key")
+    monkeypatch.setenv("KIMI_ENABLED", "true")
+    monkeypatch.setattr(main, "OpenAI", FakeClient)
+    response = client.post(
+        "/api/evidence",
+        json={
+            "video_id": "kimi-test",
+            "start_seconds": 0,
+            "end_seconds": 10,
+            "text": "项目式学习先做一个能运行的小项目，再围绕项目补齐知识。",
+        },
+    )
+    assert response.status_code == 200
+    cited_evidence_id = response.json()["id"]
+
+    response = client.post(
+        "/api/ask",
+        json={"video_id": "kimi-test", "question": "项目式学习如何开始？"},
+    )
+    body = response.json()
+    assert response.status_code == 200
+    assert body["provider"] == "Kimi"
+    assert body["citations"][0]["evidence_id"] == cited_evidence_id
+
+
+def test_kimi_agent_selects_tools_and_submits_report(monkeypatch) -> None:
+    calls = []
+    requested_tools = []
+    cited_evidence_id = [0]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            step = len(calls)
+            if step == 1:
+                name, arguments = "get_video_metadata", "{}"
+            elif step == 2:
+                name, arguments = "search_timeline", '{"query":"project learning process"}'
+            else:
+                name, arguments = "generate_report", (
+                    '{"answerable":true,"final_answer":"The project learning process includes practice.",'
+                    f'"citation_ids":[{cited_evidence_id[0]}],"support_level":"DIRECT"}}'
+                )
+            requested_tools.append(name)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[SimpleNamespace(
+                        id=f"call-{step}",
+                        function=SimpleNamespace(name=name, arguments=arguments),
+                    )],
+                ))]
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setenv("KIMI_API_KEY", "test-key")
+    monkeypatch.setenv("KIMI_ENABLED", "true")
+    monkeypatch.setattr(main, "OpenAI", FakeClient)
+    response = client.post(
+        "/api/evidence",
+        json={
+            "video_id": "agent-tool-test",
+            "start_seconds": 0,
+            "end_seconds": 10,
+            "text": "The project learning process includes practice.",
+        },
+    )
+    assert response.status_code == 200
+    cited_evidence_id[0] = response.json()["id"]
+
+    response = client.post(
+        "/api/ask",
+        json={"video_id": "agent-tool-test", "question": "What does the project learning process include?"},
+    )
+    body = response.json()
+    assert response.status_code == 200
+    assert body["provider"] == "Kimi"
+    assert body["grounded"] is True
+    assert requested_tools == [
+        "get_video_metadata",
+        "search_timeline",
+        "generate_report",
+    ]
+    assert body["tool_trace"][-1]["tool"] == "generate_report"
+
+
+def test_merge_transcript_chunks() -> None:
+    segments = [
+        (0.0, 4.0, "第一句。"),
+        (4.2, 8.0, "第二句。"),
+        (40.0, 44.0, "第三句。"),
+    ]
+    merged = main.merge_transcript_chunks(segments, max_duration=30, max_gap=2)
+    assert merged == [
+        (0.0, 8.0, "第一句。第二句。"),
+        (40.0, 44.0, "第三句。"),
+    ]
 
 def test_seed_and_list_demo_evidence() -> None:
     response = client.post("/api/demo/seed", json={"video_id": "demo-video"})
