@@ -24,7 +24,7 @@ def build_runtime_retriever(video_id: str | None) -> Callable[[str, int], list[A
             query_tokens = tokenize(query)
             with get_connection() as connection:
                 rows = connection.execute(
-                    "SELECT id, video_id, start_seconds, end_seconds, text FROM evidence "
+                    "SELECT id, video_id, start_seconds, end_seconds, text, source FROM evidence "
                     "WHERE (? IS NULL OR video_id = ?) ORDER BY start_seconds",
                     (video_id, video_id),
                 ).fetchall()

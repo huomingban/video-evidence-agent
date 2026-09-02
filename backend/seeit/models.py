@@ -31,3 +31,4 @@ class Evidence:
     start_seconds: float
     end_seconds: float
     text: str
+    source: str = "ASR"

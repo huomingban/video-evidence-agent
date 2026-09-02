@@ -43,6 +43,8 @@ def kimi_settings() -> dict[str, Any]:
         "model": os.getenv("KIMI_MODEL", "moonshot-v1-8k").strip(),
         "enabled": env_flag("KIMI_ENABLED", True),
         "timeout": float(os.getenv("KIMI_TIMEOUT_SECONDS", "45")),
+        "temperature": float(os.getenv("KIMI_TEMPERATURE", "0.6")),
+        "thinking": env_flag("KIMI_THINKING", False),
         "trust_env": env_flag("KIMI_TRUST_ENV", False),
         "proxy": os.getenv("KIMI_PROXY", "").strip() or None,
     }

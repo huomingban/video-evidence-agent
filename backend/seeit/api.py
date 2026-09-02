@@ -21,7 +21,7 @@ from .agent import (
 from .agent_graph import AGENT_GRAPH, AGENT_TOOL_NAMES
 from .config import env_flag, logger
 from . import ocr_runner
-from .ocr_runner import extract_transcript_from_video, merge_transcript_chunks, resolve_ffmpeg_path
+from .ocr_runner import extract_ocr_evidence, extract_transcript_from_video, merge_transcript_chunks, resolve_ffmpeg_path
 from .media import validate_video_filename, validate_video_id
 from .models import AskIn, DemoSeedIn, EvidenceIn
 from .retrieval import _QDRANT_CLIENT, ensure_qdrant_collection, get_qdrant_client, search_evidence, sync_evidence_to_qdrant
@@ -80,7 +80,7 @@ def health() -> dict[str, str]:
 def list_evidence(video_id: str | None = None) -> dict[str, Any]:
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT id, video_id, start_seconds, end_seconds, text FROM evidence "
+            "SELECT id, video_id, start_seconds, end_seconds, text, source FROM evidence "
             "WHERE (? IS NULL OR video_id = ?) ORDER BY start_seconds, id",
             (video_id, video_id),
         ).fetchall()
@@ -93,7 +93,7 @@ def create_evidence(payload: EvidenceIn) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="end_seconds must be greater than start_seconds")
     with get_connection() as connection:
         cursor = connection.execute(
-            "INSERT INTO evidence(video_id, start_seconds, end_seconds, text) VALUES (?, ?, ?, ?)",
+            "INSERT INTO evidence(video_id, start_seconds, end_seconds, text, source) VALUES (?, ?, ?, ?, 'ASR')",
             (payload.video_id, payload.start_seconds, payload.end_seconds, payload.text),
         )
         evidence_id = cursor.lastrowid
@@ -111,7 +111,7 @@ def seed_demo(payload: DemoSeedIn) -> dict[str, Any]:
     with get_connection() as connection:
         connection.execute("DELETE FROM evidence WHERE video_id = ?", (payload.video_id,))
         connection.executemany(
-            "INSERT INTO evidence(video_id, start_seconds, end_seconds, text) VALUES (?, ?, ?, ?)",
+            "INSERT INTO evidence(video_id, start_seconds, end_seconds, text, source) VALUES (?, ?, ?, ?, 'ASR')",
             [(payload.video_id, start, end, text) for start, end, text in demo_items],
         )
     sync_evidence_to_qdrant(payload.video_id)
@@ -163,16 +163,26 @@ async def upload_video(
     existing: sqlite3.Row | None = None
     with get_connection() as connection:
         existing = connection.execute(
-            "SELECT video_id, filename, stored_path, content_hash FROM videos WHERE video_id = ?",
+            "SELECT video_id, filename, stored_path, content_hash, ocr_status FROM videos WHERE video_id = ?",
             (video_id,),
         ).fetchone()
         evidence_count = connection.execute(
             "SELECT COUNT(*) FROM evidence WHERE video_id = ?", (video_id,)
         ).fetchone()[0]
+        ocr_count = connection.execute(
+            "SELECT COUNT(*) FROM evidence WHERE video_id = ? AND source = 'OCR'",
+            (video_id,),
+        ).fetchone()[0]
+    ocr_enabled = env_flag("OCR_ENABLED", True)
     if (
         existing is not None
         and existing["content_hash"] == content_hash
         and evidence_count > 0
+        and (
+            not ocr_enabled
+            or ocr_count > 0
+            or str(existing["ocr_status"] or "UNKNOWN").upper() in {"COMPLETED", "FAILED"}
+        )
         and Path(existing["stored_path"]).is_file()
     ):
         temporary_path.unlink(missing_ok=True)
@@ -185,36 +195,64 @@ async def upload_video(
             "deduplicated": True,
         }
 
+    transcript = []
+    transcription_error = ""
     try:
         transcript = await run_in_threadpool(extract_transcript_from_video, temporary_path, safe_name)
     except Exception as error:
+        transcription_error = str(error)
+        logger.warning("ASR failed for %s; trying OCR: %s", safe_name, error)
+    ocr_evidence = []
+    ocr_error = ""
+    try:
+        ocr_evidence = await run_in_threadpool(extract_ocr_evidence, temporary_path, safe_name)
+    except Exception as error:
+        # OCR is an enrichment step. Keep usable ASR, but report the exact
+        # OCR failure so a missing native dependency is not invisible.
+        ocr_error = str(error)
+        logger.warning("OCR failed for %s; continuing with ASR evidence: %s", safe_name, error)
+    if not transcript and not ocr_evidence:
         temporary_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    if not transcript:
-        temporary_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=422, detail="no speech transcript was produced")
+        detail = "ASR and OCR produced no evidence"
+        if transcription_error:
+            detail += f"; ASR error: {transcription_error[:300]}"
+        if ocr_error:
+            detail += f"; OCR error: {ocr_error[:300]}"
+        raise HTTPException(status_code=422, detail=detail)
 
     old_path = Path(existing["stored_path"]) if existing is not None else None
+    ocr_status = (
+        "DISABLED" if not ocr_enabled
+        else "COMPLETED" if ocr_evidence
+        else "FAILED" if ocr_error
+        else "COMPLETED"
+    )
     temporary_path.replace(stored_path)
     with get_connection() as connection:
         connection.execute("DELETE FROM evidence WHERE video_id = ?", (video_id,))
+        evidence_rows = [
+            (video_id, start, end, text, "ASR") for start, end, text in transcript
+        ] + [
+            (video_id, start, end, text, "OCR") for start, end, text in ocr_evidence
+        ]
         connection.executemany(
-            "INSERT INTO evidence(video_id, start_seconds, end_seconds, text) VALUES (?, ?, ?, ?)",
-            [(video_id, start, end, text) for start, end, text in transcript],
+            "INSERT INTO evidence(video_id, start_seconds, end_seconds, text, source) VALUES (?, ?, ?, ?, ?)",
+            evidence_rows,
         )
         connection.execute(
             """
-            INSERT INTO videos(video_id, filename, stored_path, content_hash, status, transcript_text)
-            VALUES (?, ?, ?, ?, 'COMPLETED', ?)
+            INSERT INTO videos(video_id, filename, stored_path, content_hash, status, ocr_status, transcript_text)
+            VALUES (?, ?, ?, ?, 'COMPLETED', ?, ?)
             ON CONFLICT(video_id) DO UPDATE SET
                 filename = excluded.filename,
                 stored_path = excluded.stored_path,
                 content_hash = excluded.content_hash,
                 status = excluded.status,
                 transcript_text = excluded.transcript_text,
+                ocr_status = excluded.ocr_status,
                 updated_at = CURRENT_TIMESTAMP
             """,
-            (video_id, safe_name, str(stored_path), content_hash, "\n".join(item[2] for item in transcript)),
+            (video_id, safe_name, str(stored_path), content_hash, ocr_status, "\n".join(item[2] for item in transcript)),
         )
     if old_path is not None and old_path != stored_path:
         old_path.unlink(missing_ok=True)
@@ -227,7 +265,10 @@ async def upload_video(
         "video_id": video_id,
         "filename": safe_name,
         "stored_path": str(stored_path),
-        "evidence_count": len(transcript),
+        "evidence_count": len(transcript) + len(ocr_evidence),
+        "asr_count": len(transcript),
+        "ocr_count": len(ocr_evidence),
+        **({"ocr_error": ocr_error} if ocr_error else {}),
         "status": "uploaded",
         "deduplicated": False,
     }

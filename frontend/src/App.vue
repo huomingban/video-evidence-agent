@@ -118,7 +118,12 @@ async function uploadVideo() {
     await loadEvidence();
     await loadVideos();
     result.value = null;
-    message.value = `已上传 ${payload.filename}，${payload.evidence_count} 条转录证据已写入。`;
+    const sourceSummary = [
+      `ASR ${payload.asr_count ?? 0} 条`,
+      `OCR ${payload.ocr_count ?? 0} 条`,
+    ].join("，");
+    const ocrNotice = payload.ocr_error ? ` OCR 未完成：${payload.ocr_error}` : "";
+    message.value = `已上传 ${payload.filename}，${sourceSummary}证据已写入。${ocrNotice}`;
   } catch (error) {
     message.value = error.message;
   } finally {
@@ -209,6 +214,7 @@ onMounted(async () => {
         <div v-if="evidence.length" class="evidence-list">
           <article v-for="item in evidence" :key="item.id" class="evidence-item">
             <div class="timestamp">
+              <span class="evidence-source">{{ item.source || "ASR" }}</span>
               {{ formatSeconds(item.start_seconds) }} - {{ formatSeconds(item.end_seconds) }}
             </div>
             <p>{{ item.text }}</p>

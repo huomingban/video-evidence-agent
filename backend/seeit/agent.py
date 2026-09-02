@@ -3,20 +3,62 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 try:
-    import httpx2
+    import httpx
 except Exception:
-    httpx2 = None
+    httpx = None
 from .config import UPLOADS_DIR, env_flag, kimi_settings, logger
 from .models import Evidence
-from .retrieval import format_timestamp, load_video_evidence, public_evidence, search_evidence, tokenize
+from .retrieval import (
+    format_timestamp,
+    load_video_evidence,
+    public_evidence,
+    search_evidence,
+    search_qdrant,
+    tokenize,
+)
 from .runtime_retrieval import build_runtime_retriever
 from .storage import get_connection
+
+
+def kimi_failure_result(question: str, error: Exception | str) -> dict[str, Any]:
+    """Return a useful Kimi error without exposing credentials or huge traces."""
+    detail = str(error).replace("\n", " ").strip()
+    settings = kimi_settings()
+    if settings.get("api_key"):
+        detail = detail.replace(settings["api_key"], "<redacted>")
+    detail = re.sub(r"\b(?:sk|ak)-[A-Za-z0-9_-]{8,}\b", "<redacted>", detail)
+    detail = re.sub(r"\borg-[A-Za-z0-9_-]{8,}\b", "<org-redacted>", detail)
+    detail = detail[:500] or "unknown Kimi request error"
+    return {
+        "question": question,
+        "answer": f"Kimi 请求失败：{detail}",
+        "grounded": False,
+        "citations": [],
+        "provider": "Kimi error",
+        "error": detail,
+        "trace": [f"Kimi request failed: {detail}"],
+    }
+
+
+def _create_kimi_completion(client: Any, **kwargs: Any) -> Any:
+    """Retry rate-limited requests using the provider's requested delay."""
+    for attempt in range(4):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as error:
+            status_code = getattr(error, "status_code", None)
+            if status_code != 429 or attempt == 3:
+                raise
+            match = re.search(r"after\s+(\d+)\s+seconds?", str(error), flags=re.I)
+            delay = int(match.group(1)) if match else min(30, 2 ** (attempt + 1))
+            time.sleep(max(1, min(delay + 1, 30)))
 
 
 def is_summary_goal(goal: str) -> bool:
@@ -157,6 +199,11 @@ class AgentToolbox:
                         "properties": {
                             "query": {"type": "string", "minLength": 1},
                             "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
+                            "sources": {
+                                "type": "array",
+                                "items": {"type": "string", "enum": ["ASR", "OCR"]},
+                                "maxItems": 2,
+                            },
                         },
                         "required": ["query"],
                         "additionalProperties": False,
@@ -303,7 +350,21 @@ class AgentToolbox:
 
     def _overview(self, arguments: dict[str, Any]) -> dict[str, Any]:
         count = max(4, min(int(arguments.get("max_segments", 12)), 20))
-        selected = self._evenly_spaced(self.evidence, count)
+        # ASR usually has many more rows than OCR. Reserve part of the
+        # overview for each available source so OCR remains visible to the
+        # Planner and Writer instead of being crowded out by ASR rows.
+        sources = sorted({item.source.upper() for item in self.evidence})
+        selected: list[Evidence] = []
+        if len(sources) > 1:
+            per_source = max(1, count // len(sources))
+            for source in sources:
+                selected.extend(self._evenly_spaced(
+                    [item for item in self.evidence if item.source.upper() == source],
+                    per_source,
+                ))
+            selected = sorted(selected, key=lambda item: (item.start_seconds, item.id))[:count]
+        else:
+            selected = self._evenly_spaced(self.evidence, count)
         return {
             "ok": True,
             "sampling": "even_timeline",
@@ -315,7 +376,31 @@ class AgentToolbox:
         if not query:
             raise ValueError("query 不能为空")
         count = max(1, min(int(arguments.get("top_k", 6)), 10))
-        matches = self.retriever(query, count)
+        requested_sources = {
+            str(source).upper() for source in (arguments.get("sources") or [])
+            if str(source).upper() in {"ASR", "OCR"}
+        }
+        matches = self.retriever(query, max(count * 4, 20) if requested_sources else count)
+        if requested_sources:
+            matches = [item for item in matches if item.source.upper() in requested_sources]
+            # A hybrid retriever may return enough ASR hits to fill its limit
+            # before OCR is considered. Complete an explicit source request
+            # from the source-specific timeline pool.
+            source_pool = [
+                item for item in self.evidence
+                if item.source.upper() in requested_sources
+            ]
+            query_tokens = tokenize(query)
+            source_pool.sort(
+                key=lambda item: (
+                    -len(query_tokens & tokenize(item.text)),
+                    item.start_seconds,
+                    item.id,
+                )
+            )
+            seen_ids = {item.id for item in matches}
+            matches.extend(item for item in source_pool if item.id not in seen_ids)
+        matches = matches[:count]
         return {
             "ok": True,
             "query": query,
@@ -348,6 +433,7 @@ class AgentToolbox:
             "startMs": round(item.start_seconds * 1000),
             "endMs": round(item.end_seconds * 1000),
             "content": item.text,
+            "source": item.source,
         })
         return result
 
@@ -428,7 +514,7 @@ def search_keyword_tool(question: str, video_id: str | None) -> list[Evidence]:
     question_tokens = tokenize(question)
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT id, video_id, start_seconds, end_seconds, text FROM evidence "
+            "SELECT id, video_id, start_seconds, end_seconds, text, source FROM evidence "
             "WHERE (? IS NULL OR video_id = ?) ORDER BY start_seconds",
             (video_id, video_id),
         ).fetchall()
@@ -468,6 +554,7 @@ def evidence_citations(evidence: list[Evidence]) -> list[dict[str, Any]]:
             "evidence_id": item.id,
             "timestamp": f"{format_timestamp(item.start_seconds)} - {format_timestamp(item.end_seconds)}",
             "text": item.text,
+            "source": item.source,
         }
         for item in evidence
     ]
@@ -576,8 +663,8 @@ def run_kimi_agent(question: str, video_id: str | None, history: list[dict[str, 
     )
     try:
         http_client = None
-        if httpx2 is not None:
-            http_client = httpx2.Client(
+        if httpx is not None:
+            http_client = httpx.Client(
                 trust_env=settings["trust_env"],
                 proxy=settings["proxy"],
                 timeout=settings["timeout"],
@@ -591,12 +678,13 @@ def run_kimi_agent(question: str, video_id: str | None, history: list[dict[str, 
         )
         max_steps = max(2, min(int(os.getenv("AGENT_MAX_TOOL_STEPS", "8")), 12))
         for step in range(max_steps):
-            response = client.chat.completions.create(
+            response = _create_kimi_completion(client,
                 model=settings["model"],
-                temperature=0.1,
+                temperature=settings["temperature"],
                 messages=messages,
                 tools=toolbox.schemas(),
                 tool_choice="auto",
+                **({"extra_body": {"thinking": {"type": "enabled" if settings["thinking"] else "disabled"}}}),
             )
             message = response.choices[0].message
             tool_calls = list(_message_value(message, "tool_calls", []) or [])
@@ -664,9 +752,9 @@ def run_kimi_agent(question: str, video_id: str | None, history: list[dict[str, 
                 },
             ])
         raise RuntimeError("Kimi Agent exceeded its tool-step budget without an accepted report")
-    except Exception:
+    except Exception as error:
         logger.exception("Kimi Agent execution failed")
-        return None
+        return kimi_failure_result(question, error)
 
 
 def generate_kimi_answer(question: str, evidence: list[Evidence]) -> tuple[str, list[Evidence]] | None:
@@ -692,8 +780,8 @@ def generate_kimi_answer(question: str, evidence: list[Evidence]) -> tuple[str, 
     )
     try:
         http_client = None
-        if httpx2 is not None:
-            http_client = httpx2.Client(
+        if httpx is not None:
+            http_client = httpx.Client(
                 trust_env=settings["trust_env"],
                 proxy=settings["proxy"],
                 timeout=settings["timeout"],
@@ -705,9 +793,9 @@ def generate_kimi_answer(question: str, evidence: list[Evidence]) -> tuple[str, 
             max_retries=1,
             http_client=http_client,
         )
-        response = client.chat.completions.create(
+        response = _create_kimi_completion(client,
             model=settings["model"],
-            temperature=0.1,
+            temperature=settings["temperature"],
             messages=[
                 {
                     "role": "system",
@@ -715,6 +803,7 @@ def generate_kimi_answer(question: str, evidence: list[Evidence]) -> tuple[str, 
                 },
                 {"role": "user", "content": prompt},
             ],
+            **({"extra_body": {"thinking": {"type": "enabled" if settings["thinking"] else "disabled"}}}),
         )
         content = response.choices[0].message.content or ""
         parsed = parse_kimi_json(content)
@@ -783,8 +872,8 @@ class KimiStructuredProvider:
             raise RuntimeError("openai package is not installed")
         settings = kimi_settings()
         http_client = None
-        if httpx2 is not None:
-            http_client = httpx2.Client(
+        if httpx is not None:
+            http_client = httpx.Client(
                 trust_env=settings["trust_env"],
                 proxy=settings["proxy"],
                 timeout=settings["timeout"],
@@ -824,14 +913,23 @@ class KimiStructuredProvider:
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self._settings["model"],
-            "temperature": 0.1,
+            "temperature": self._settings["temperature"],
             "messages": messages,
             "tools": tools,
         }
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
-        response = self._client.chat.completions.create(**kwargs)
-        return self._message_dict(response.choices[0].message)
+        kwargs["extra_body"] = {
+            "thinking": {"type": "enabled" if self._settings["thinking"] else "disabled"}
+        }
+        # The OpenAI-compatible SDK returns a ChatCompletion object.  The
+        # structured graph consumes a plain message mapping, so normalize the
+        # SDK object at this boundary instead of leaking it into the graph.
+        response = _create_kimi_completion(self._client, **kwargs)
+        choices = _message_value(response, "choices", []) or []
+        if not choices:
+            raise RuntimeError("Kimi response did not contain choices")
+        return self._message_dict(_message_value(choices[0], "message", {}))
 
 
 def run_structured_kimi_agent(
@@ -884,6 +982,6 @@ def run_structured_kimi_agent(
             ],
             "tool_trace": toolbox.trace(),
         }
-    except Exception:
+    except Exception as error:
         logger.exception("Structured Kimi Agent execution failed")
-        return None
+        return kimi_failure_result(question, error)

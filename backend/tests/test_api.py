@@ -46,7 +46,9 @@ def test_health() -> None:
     assert response.json()["status"] == "ok"
 
 
-def test_evidence_answer_contains_citation() -> None:
+def test_evidence_answer_contains_citation(monkeypatch) -> None:
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(main, "extract_ocr_evidence", lambda video_path, file_name: [(0.0, 15.0, "视频标题 OCR")])
     response = client.post(
         "/api/evidence",
         json={
@@ -66,6 +68,7 @@ def test_evidence_answer_contains_citation() -> None:
     assert response.status_code == 200
     assert body["grounded"] is True
     assert body["citations"][0]["timestamp"] == "00:12 - 00:35"
+    monkeypatch.undo()
 
 
 def test_unknown_question_refuses() -> None:
@@ -74,6 +77,7 @@ def test_unknown_question_refuses() -> None:
     assert response.json()["grounded"] is False
 
 def test_upload_video_creates_transcript_evidence(monkeypatch) -> None:
+    monkeypatch.setattr(main, "extract_ocr_evidence", lambda video_path, file_name: [(0.0, 15.0, "ocr evidence")])
     monkeypatch.setattr(
         main,
         "extract_transcript_from_video",
@@ -88,6 +92,10 @@ def test_upload_video_creates_transcript_evidence(monkeypatch) -> None:
     body = response.json()
     assert body['video_id'] == 'uploaded-demo'
     assert body['stored_path'].endswith('demo-clip.mp4')
+    assert body['asr_count'] == 1
+    assert body['ocr_count'] == 1
+    sources = [item['source'] for item in client.get('/api/evidence', params={'video_id': 'uploaded-demo'}).json()['items']]
+    assert sources == ['ASR', 'OCR']
 
     response = client.post('/api/ask', json={
         'video_id': 'uploaded-demo',

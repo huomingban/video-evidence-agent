@@ -27,7 +27,8 @@ def get_connection() -> sqlite3.Connection:
             video_id TEXT NOT NULL,
             start_seconds REAL NOT NULL,
             end_seconds REAL NOT NULL,
-            text TEXT NOT NULL
+            text TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'ASR'
         )
         """
     )
@@ -39,6 +40,7 @@ def get_connection() -> sqlite3.Connection:
             stored_path TEXT NOT NULL,
             content_hash TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'COMPLETED',
+            ocr_status TEXT NOT NULL DEFAULT 'UNKNOWN',
             transcript_text TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -85,6 +87,8 @@ def get_connection() -> sqlite3.Connection:
         """
     )
     # Keep databases created by earlier versions compatible with the current schema.
+    ensure_column(connection, "evidence", "source", "TEXT NOT NULL DEFAULT 'ASR'")
+    ensure_column(connection, "videos", "ocr_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
     ensure_column(connection, "agent_sessions", "title", "TEXT")
     return connection
 
@@ -98,10 +102,12 @@ def init_db() -> None:
                 video_id TEXT NOT NULL,
                 start_seconds REAL NOT NULL,
                 end_seconds REAL NOT NULL,
-                text TEXT NOT NULL
+                text TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'ASR'
             )
-            """
+        """
         )
+        ensure_column(connection, "evidence", "source", "TEXT NOT NULL DEFAULT 'ASR'")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS agent_sessions (

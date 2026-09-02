@@ -142,7 +142,7 @@ def sync_evidence_to_qdrant(video_id: str | None = None) -> None:
             )
         with get_connection() as connection:
             rows = connection.execute(
-                "SELECT id, video_id, start_seconds, end_seconds, text FROM evidence "
+                "SELECT id, video_id, start_seconds, end_seconds, text, source FROM evidence "
                 "WHERE (? IS NULL OR video_id = ?) ORDER BY start_seconds",
                 (video_id, video_id),
             ).fetchall()
@@ -162,6 +162,7 @@ def sync_evidence_to_qdrant(video_id: str | None = None) -> None:
                     "start_seconds": row["start_seconds"],
                     "end_seconds": row["end_seconds"],
                     "text": row["text"],
+                    "source": row["source"],
                 },
             }
             for index, row in enumerate(rows)
@@ -203,6 +204,7 @@ def search_qdrant(question: str, video_id: str | None, limit: int = 5) -> list[E
                     start_seconds=float(payload.get("start_seconds", 0.0)),
                     end_seconds=float(payload.get("end_seconds", 0.0)),
                     text=str(payload.get("text", "")),
+                    source=str(payload.get("source", "ASR")),
                 )
             )
         return results
@@ -214,7 +216,7 @@ def search_evidence(question: str, video_id: str | None, limit: int = 5) -> list
     question_tokens = tokenize(question)
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT id, video_id, start_seconds, end_seconds, text FROM evidence "
+            "SELECT id, video_id, start_seconds, end_seconds, text, source FROM evidence "
             "WHERE (? IS NULL OR video_id = ?) ORDER BY start_seconds",
             (video_id, video_id),
         ).fetchall()
@@ -272,11 +274,11 @@ def public_evidence(item: Evidence) -> dict[str, Any]:
     """Return the small, stable evidence shape exposed to the model."""
     return {
         "evidence_id": item.id,
-        "source": "ASR",
         "start_ms": round(item.start_seconds * 1000),
         "end_ms": round(item.end_seconds * 1000),
         "timestamp": f"{format_timestamp(item.start_seconds)} - {format_timestamp(item.end_seconds)}",
         "text": item.text,
+        "source": item.source,
     }
 
 
@@ -285,7 +287,7 @@ def load_video_evidence(video_id: str | None) -> list[Evidence]:
         return []
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT id, video_id, start_seconds, end_seconds, text FROM evidence "
+            "SELECT id, video_id, start_seconds, end_seconds, text, source FROM evidence "
             "WHERE video_id = ? ORDER BY start_seconds, id",
             (video_id,),
         ).fetchall()
