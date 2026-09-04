@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from typing import Any, TypedDict
@@ -17,6 +18,7 @@ from .retrieval import plan_evidence_requirements
 PROMPT_VERSION = "video-evidence-agent-v5.2-grounded-synthesis"
 MAX_REQUIREMENTS = 6
 MAX_LEDGER_EVIDENCE = 18
+MAX_REPORT_EVIDENCE = 9
 MAX_EVIDENCE_CONTENT = 360
 
 
@@ -36,6 +38,8 @@ class StructuredAgentState(TypedDict, total=False):
     context_chars: dict[str, int]
     acceptance_mode: str
     verification_passes: int
+    prefetch_time_evidence: dict[str, Any]
+    prefetch_coverage_evidence: dict[str, Any]
 
 
 class AgentQualityGateError(RuntimeError):
@@ -182,7 +186,7 @@ REPORT_SCHEMA = _tool_schema(
             "evidenceIds": {
                 "type": "array",
                 "items": {"type": "string"},
-                "maxItems": 18,
+                "maxItems": MAX_REPORT_EVIDENCE,
             },
             "suggestions": {
                 "type": "array",
@@ -251,7 +255,6 @@ def _forced_completion(
     if not callable(completion):
         raise TypeError("结构化 Agent 需要支持 _completion(messages, tools, tool_choice) 的 Provider")
     name = str(schema["function"]["name"])
-    choice = {"type": "function", "function": {"name": name}}
     phase = {
         "submit_evidence_plan": "PLANNER",
         "submit_evidence_verification": "VERIFIER",
@@ -262,11 +265,11 @@ def _forced_completion(
     setattr(provider, "_agent_phase", phase)
     try:
         try:
-            return completion(messages, [schema], tool_choice=choice)
+            return completion(messages, [schema])
         except TypeError as exc:
             if "tool_choice" not in str(exc):
                 raise
-            return completion(messages, [schema])
+            return completion(messages, [schema], tool_choice="auto")
     finally:
         if previous_phase is None:
             try:
@@ -431,9 +434,16 @@ def _plan_node(provider: Any, state: StructuredAgentState) -> dict[str, Any]:
         "涉及‘有但没有/除了’时使用 EXCLUSION_SET；时间指代使用 TEMPORAL_WINDOW。"
     )
     prompt = system + "\n用户问题：" + goal
+    use_llm_planner = os.getenv("DEEPSEEK_LLM_PLANNER_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
     if is_summary_goal(goal):
         evidence_plan = _summary_evidence_plan(goal)
         planner_mode = "DETERMINISTIC_SUMMARY"
+        planner_calls = 0
+    elif not use_llm_planner:
+        evidence_plan = _fallback_evidence_plan(goal)
+        planner_mode = "DETERMINISTIC_LOW_RPM"
         planner_calls = 0
     else:
         message = _forced_completion(
@@ -458,12 +468,60 @@ def _segment_key(item: dict[str, Any]) -> str:
     return str(item.get("segmentId") or f"{item.get('source')}:{item.get('startMs')}:{item.get('endMs')}")
 
 
+def _prefetch_time_node(toolbox: AgentToolbox, state: StructuredAgentState) -> dict[str, Any]:
+    """Resolve explicit time anchors before any model-driven retrieval."""
+    goal = str(state.get("goal") or "")
+    anchors = extract_goal_timestamps_ms(goal)
+    windows = []
+    for timestamp_ms in anchors:
+        window = toolbox.execute("get_evidence_window", {
+            "timestamp_ms": timestamp_ms,
+            "before_ms": 15000,
+            "after_ms": 15000,
+        })
+        segments = [dict(item) for item in window.get("segments", [])]
+        following_ocr = next(
+            (item for item in segments if str(item.get("source", "")).upper() == "OCR"
+             and int(item.get("startMs", 0)) >= timestamp_ms),
+            None,
+        )
+        windows.append({
+            "anchorTimestampMs": timestamp_ms,
+            "segments": segments[:16],
+            "likelyFollowingOcr": following_ocr,
+        })
+    return {"prefetch_time_evidence": {
+        "anchors": anchors,
+        "windows": windows,
+        "count": len(windows),
+    }}
+
+
+def _prefetch_coverage_node(toolbox: AgentToolbox, state: StructuredAgentState) -> dict[str, Any]:
+    """Build the deterministic coverage candidate set once per first report."""
+    goal = str(state.get("goal") or "").strip()
+    if not goal:
+        return {"prefetch_coverage_evidence": {}}
+    result = toolbox.prefetch_goal_evidence(goal, top_k=8)
+    return {"prefetch_coverage_evidence": result}
+
+
 def _retrieve_node(toolbox: AgentToolbox, state: StructuredAgentState) -> dict[str, Any]:
     plan = state["evidence_plan"]
     goal = str(state.get("goal") or "")
     by_segment: dict[str, dict[str, Any]] = {}
     requirement_candidates: dict[str, list[str]] = {}
     raw_candidate_counts: dict[str, int] = {}
+    coverage_prefetch = state.get("prefetch_coverage_evidence") or {}
+    prefetched_matches = [dict(item) for item in coverage_prefetch.get("matches", [])]
+    prefetched_by_requirement: dict[str, list[dict[str, Any]]] = {}
+    for item in prefetched_matches:
+        for requirement_id in item.get("coverageRequirementIds", []):
+            prefetched_by_requirement.setdefault(str(requirement_id), []).append(item)
+    prefetched_requirement_lists = [
+        [dict(item) for item in requirement.get("candidateEvidence", [])]
+        for requirement in coverage_prefetch.get("evidenceSufficiency", {}).get("requirements", [])
+    ]
 
     def add_segment(item: dict[str, Any], requirement_id: str) -> None:
         key = _segment_key(item)
@@ -499,14 +557,33 @@ def _retrieve_node(toolbox: AgentToolbox, state: StructuredAgentState) -> dict[s
                 add_segment(item, requirement_id)
         requirements_to_search = []
 
-    for requirement in requirements_to_search:
+    for requirement_index, requirement in enumerate(requirements_to_search):
         requirement_id = str(requirement["requirementId"])
-        result = toolbox.execute("search_timeline", {
-            "query": str(requirement["retrievalQuery"]),
-            "top_k": 8,
-            "sources": requirement.get("expectedSources", []),
-        })
-        matches = [dict(item) for item in result.get("matches", [])]
+        matches = list(prefetched_by_requirement.get(requirement_id, []))
+        # The prefetch may use deterministic R ids. Match by query when the
+        # LLM assigned a different id, then perform a targeted fallback search.
+        if not matches:
+            status_items = coverage_prefetch.get("evidenceSufficiency", {}).get("requirements", [])
+            if requirement_index < len(status_items):
+                candidate_ids = {
+                    str(item) for item in status_items[requirement_index].get("candidateEvidenceIds", [])
+                }
+                matches = [
+                    item for item in prefetched_matches
+                    if str(item.get("evidenceId", item.get("evidence_id"))) in candidate_ids
+                ]
+        if not matches:
+            query = str(requirement["retrievalQuery"]).strip()
+            for item in prefetched_matches:
+                if query and query in str(item.get("content", "")):
+                    matches.append(item)
+        if not matches:
+            result = toolbox.execute("search_timeline", {
+                "query": str(requirement["retrievalQuery"]),
+                "top_k": 8,
+                "sources": requirement.get("expectedSources", []),
+            })
+            matches = [dict(item) for item in result.get("matches", [])]
         raw_candidate_counts[requirement_id] = len(matches)
         policy = str(requirement.get("completionPolicy") or "DIRECT")
         match_limit = 8 if policy == "DIRECT" else 4
@@ -548,12 +625,13 @@ def _retrieve_node(toolbox: AgentToolbox, state: StructuredAgentState) -> dict[s
                     add_segment(item, requirement_id)
 
     time_hints = extract_goal_timestamps_ms(goal)
+    time_prefetch = state.get("prefetch_time_evidence") or {}
+    windows_by_anchor = {
+        int(item.get("anchorTimestampMs", 0)): item
+        for item in time_prefetch.get("windows", [])
+    }
     for timestamp_ms in time_hints:
-        window = toolbox.execute("get_evidence_window", {
-            "timestamp_ms": timestamp_ms,
-            "before_ms": 15000,
-            "after_ms": 15000,
-        })
+        window = windows_by_anchor.get(timestamp_ms) or {}
         temporal_ids = [
             str(item["requirementId"]) for item in plan["requirements"]
             if item.get("completionPolicy") == "TEMPORAL_WINDOW"
@@ -581,6 +659,8 @@ def _retrieve_node(toolbox: AgentToolbox, state: StructuredAgentState) -> dict[s
             "rawCandidateCount": sum(raw_candidate_counts.values()),
             "compactEvidenceCount": len(evidence),
             "timeHintCount": len(time_hints),
+            "prefetchedCoverageCount": len(prefetched_matches),
+            "prefetchedTimeWindowCount": len(windows_by_anchor),
         },
     }
     ledger["statistics"]["serializedChars"] = len(_json(ledger))
@@ -730,8 +810,12 @@ def _verify_node(provider: Any, state: StructuredAgentState) -> dict[str, Any]:
     verification_passes = 1
     context_chars = {**state.get("context_chars", {}), "verifier1": len(prompt)}
     should_audit = (
-        not verification["overallSufficient"]
-        or _verification_needs_deictic_audit(plan, ledger, verification)
+        os.getenv("DEEPSEEK_ENABLE_VERIFIER_AUDIT", "true").strip().lower()
+        in {"1", "true", "yes", "on"}
+        and (
+            not verification["overallSufficient"]
+            or _verification_needs_deictic_audit(plan, ledger, verification)
+        )
     )
     if should_audit and ledger.get("evidence"):
         audit_system = (
@@ -792,7 +876,7 @@ def _normalize_draft(value: dict[str, Any] | None) -> dict[str, Any]:
             if " ".join(str(item).split())
         ],
         "evidenceIds": list(dict.fromkeys(
-            str(item) for item in value.get("evidenceIds", [])[:18] if str(item)
+            str(item) for item in value.get("evidenceIds", [])[:MAX_REPORT_EVIDENCE] if str(item)
         )),
         "suggestions": [
             " ".join(str(item).split())[:1000]
@@ -853,7 +937,7 @@ def _write_node(provider: Any, state: StructuredAgentState, *, revision: bool = 
 def _resolved_citations(draft: dict[str, Any], ledger: dict[str, Any]) -> list[dict[str, Any]]:
     by_id = {str(item["evidenceId"]): item for item in ledger.get("evidence", [])}
     citations = []
-    for evidence_id in draft.get("evidenceIds", []):
+    for evidence_id in draft.get("evidenceIds", [])[:MAX_REPORT_EVIDENCE]:
         item = by_id.get(str(evidence_id))
         if not item:
             continue
@@ -865,6 +949,45 @@ def _resolved_citations(draft: dict[str, Any], ledger: dict[str, Any]) -> list[d
             "content": str(item.get("content", "")),
         })
     return citations
+
+
+def _rebalance_draft_sources(
+    draft: dict[str, Any],
+    ledger: dict[str, Any],
+    verified_ids: set[str],
+) -> None:
+    """Keep visible text evidence balanced when ASR has many more rows.
+
+    The model still chooses the claims. This only replaces the weakest tail
+    ASR selections when OCR candidates exist, so slide titles and numbers are
+    not silently lost to long transcript chunks.
+    """
+    selected = list(dict.fromkeys(str(item) for item in draft.get("evidenceIds", [])))
+    evidence = ledger.get("evidence", [])
+    by_id = {str(item.get("evidenceId")): item for item in evidence}
+    available_ocr = [
+        item for item in evidence
+        if str(item.get("source", "")).upper() == "OCR"
+        and str(item.get("evidenceId")) not in selected
+        and str(item.get("evidenceId")) in verified_ids
+    ]
+    if not selected or not available_ocr:
+        return
+    selected_ocr = sum(
+        str(by_id.get(item, {}).get("source", "")).upper() == "OCR"
+        for item in selected
+    )
+    target_ocr = max(1, (len(selected) * 3 + 4) // 5)
+    if selected_ocr >= target_ocr:
+        return
+    needed = min(target_ocr - selected_ocr, len(available_ocr))
+    replacement_indices = [
+        index for index in range(len(selected) - 1, -1, -1)
+        if str(by_id.get(selected[index], {}).get("source", "")).upper() != "OCR"
+    ][:needed]
+    for index, item in zip(replacement_indices, available_ocr):
+        selected[index] = str(item.get("evidenceId"))
+    draft["evidenceIds"] = selected[:MAX_REPORT_EVIDENCE]
 
 
 def _normalize_critic(value: dict[str, Any] | None) -> dict[str, Any]:
@@ -888,6 +1011,12 @@ def _critic_node(provider: Any, toolbox: AgentToolbox, state: StructuredAgentSta
     plan = state["evidence_plan"]
     ledger = state["evidence_ledger"]
     verification = state["verification"]
+    verified_ids = {
+        str(evidence_id)
+        for requirement in verification.get("requirements", [])
+        for evidence_id in requirement.get("evidenceIds", [])
+    }
+    _rebalance_draft_sources(draft, ledger, verified_ids)
     system = (
         "你是独立视频答案 Critic。逐项检查：回答性是否正确、所有必要槽位是否回答、"
         "是否与证据或排除条件矛盾、是否加入外部知识、evidenceId 是否真正支持对应结论。"
@@ -1002,6 +1131,8 @@ def run_structured_evidence_agent(
 ) -> dict[str, Any]:
     workflow = StateGraph(StructuredAgentState)
     workflow.add_node("structured_planner", lambda state: _plan_node(provider, state))
+    workflow.add_node("prefetch_time_evidence", lambda state: _prefetch_time_node(toolbox, state))
+    workflow.add_node("prefetch_coverage_evidence", lambda state: _prefetch_coverage_node(toolbox, state))
     workflow.add_node("retrieve_evidence_slots", lambda state: _retrieve_node(toolbox, state))
     workflow.add_node("verify_evidence_ledger", lambda state: _verify_node(provider, state))
     workflow.add_node("write_grounded_report", lambda state: _write_node(provider, state))
@@ -1013,7 +1144,9 @@ def run_structured_evidence_agent(
     workflow.add_node("verify_followup_evidence", lambda state: _verify_node(provider, state))
     workflow.add_node("revise_report", lambda state: _write_node(provider, state, revision=True))
     workflow.add_edge(START, "structured_planner")
-    workflow.add_edge("structured_planner", "retrieve_evidence_slots")
+    workflow.add_edge("structured_planner", "prefetch_time_evidence")
+    workflow.add_edge("prefetch_time_evidence", "prefetch_coverage_evidence")
+    workflow.add_edge("prefetch_coverage_evidence", "retrieve_evidence_slots")
     workflow.add_edge("retrieve_evidence_slots", "verify_evidence_ledger")
     workflow.add_edge("verify_evidence_ledger", "write_grounded_report")
     workflow.add_edge("write_grounded_report", "critic_review")
@@ -1045,14 +1178,26 @@ def run_structured_evidence_agent(
         final_state["acceptance_mode"] = "SAFE_REFUSAL_AFTER_CRITIC_REVISION"
         last_report = fallback_report
     ledger = final_state.get("evidence_ledger") or {}
+    draft = final_state.get("draft_report") or {}
+    report = {
+        "answerable": bool(last_report.get("answerable", draft.get("answerable", False))),
+        "title": str(draft.get("title") or "视频分析报告"),
+        "finalAnswer": str(last_report.get("final_answer") or draft.get("finalAnswer") or ""),
+        "conclusions": list(draft.get("conclusions") or []),
+        "evidence": list(last_report.get("citations") or [])[:MAX_REPORT_EVIDENCE],
+        "suggestions": list(draft.get("suggestions") or []),
+    }
     return {
         **last_report,
+        "report": report,
         "agentGraph": {
             "framework": "LangGraph",
             "promptVersion": PROMPT_VERSION,
             "nodes": [
-                "structured_planner",
-                "retrieve_evidence_slots",
+            "structured_planner",
+            "prefetch_time_evidence",
+            "prefetch_coverage_evidence",
+            "retrieve_evidence_slots",
                 "verify_evidence_ledger",
                 "write_grounded_report",
                 "critic_review",

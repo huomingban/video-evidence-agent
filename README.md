@@ -1,4 +1,4 @@
-# VideoEvidence Agent
+# TraceLens
 
 📹 面向长视频的可追溯 AI Agent，支持证据检索、工具调用、决策链可视化。
 
@@ -42,16 +42,16 @@
 cd backend
 pip install -r requirements.txt
 Copy-Item .env.example .env
-# 编辑 .env，填写 KIMI_API_KEY 和 KIMI_MODEL
-python -m pytest -q              # 运行测试（14 个测试，不调用真实 Kimi）
-uvicorn seeit.main:app --reload --port 9090
+# 编辑 .env，填写 DEEPSEEK_API_KEY 和 DEEPSEEK_MODEL
+python -m pytest -q              # 运行测试（不调用真实 DeepSeek）
+uvicorn tracelens.main:app --reload --port 9090
 ```
 
-Kimi 配置保存在 `backend/.env`，后端启动时会自动读取，不需要每次重新输入。`.env` 已加入 Git 忽略规则，不能提交真实 API Key。默认使用 Kimi 的 OpenAI 兼容地址 `https://api.moonshot.cn/v1`；`KIMI_MODEL` 请填写你的 Kimi 账户当前可用的模型名称。
+DeepSeek 配置保存在 `backend/.env`，后端启动时会自动读取，不需要每次重新输入。`.env` 已加入 Git 忽略规则，不能提交真实 API Key。默认使用 DeepSeek 的 OpenAI 兼容地址 `https://api.deepseek.com/v1`，模型为 `deepseek-chat`。
 
-程序默认不读取系统 HTTP 代理（`KIMI_TRUST_ENV=false`），适合本机存在失效代理配置的情况。如果你的网络必须经过代理，请在 `.env` 中设置 `KIMI_TRUST_ENV=true`，或填写 `KIMI_PROXY=http://代理地址:端口`。
+程序默认不读取系统 HTTP 代理（`DEEPSEEK_TRUST_ENV=false`），适合本机存在失效代理配置的情况。如果你的网络必须经过代理，请在 `.env` 中设置 `DEEPSEEK_TRUST_ENV=true`，或填写 `DEEPSEEK_PROXY=http://代理地址:端口`。
 
-未填写 `KIMI_API_KEY` 时，系统仍可使用本地检索和模板回退回答；填写后 `/api/ask` 会调用 Kimi，并校验返回的引用只能来自检索到的证据。
+未填写 `DEEPSEEK_API_KEY` 时，系统仍可使用本地检索和模板回退回答；填写后 `/api/ask` 首次提问会调用 DeepSeek，并校验返回的引用只能来自检索到的证据。已有会话的追问只调用追问生成器，返回自然语言段落。
 
 上传视频时，系统会先用 FFmpeg 抽取音频，再由 faster-whisper 转写。视频没有可识别语音、文件损坏或转写失败时，接口会返回明确错误，不会写入伪造证据。
 
@@ -85,7 +85,7 @@ npm run dev
 
 ```powershell
 cd backend
-pytest -q                        # 14 个测试通过，不调用真实 Kimi
+pytest -q                        # 运行测试，不调用真实 DeepSeek
 pytest -v                        # 详细输出
 pytest tests/test_api.py::test_ask_includes_trace -v  # 单个测试
 ```
@@ -193,12 +193,12 @@ curl http://127.0.0.1:9090/api/metrics | jq
 |---|---|---|
 | `Media` | `videos` SQLite 表 + `data/uploads/` | 保存视频资源、哈希、文件路径和转录状态 |
 | `EvidenceSegment` | `evidence` SQLite 表 | 保存带开始/结束时间的转录证据 |
-| `AgentToolbox` | `backend/seeit/agent.py` 中的 `AgentToolbox` | 提供元数据、时间轴检索、证据窗口和报告工具 |
-| `agent_structured` | `backend/seeit/agent_structured.py` | 完整 Planner → Retriever → Verifier → Writer → Critic 工作流，使用 Evidence Ledger 和 Critic 质量门禁 |
-| `agent_graph` | `backend/seeit/agent_graph.py` | 保留旧版 Retrieve → Verify → Answer 兼容流程 |
+| `AgentToolbox` | `backend/tracelens/agent.py` 中的 `AgentToolbox` | 提供元数据、时间轴检索、证据窗口和报告工具 |
+| `agent_structured` | `backend/tracelens/agent_structured.py` | 完整 Planner → Retriever → Verifier → Writer → Critic 工作流，使用 Evidence Ledger 和 Critic 质量门禁 |
+| `agent_graph` | `backend/tracelens/agent_graph.py` | 保留旧版 Retrieve → Verify → Answer 兼容流程 |
 | `generate_report` | Agent 工具的结构化报告提交 | 后端校验引用 ID 和证据覆盖后才接受 |
-| Qdrant 检索 | `backend/seeit/qdrant_retrieval.py` + `retrieval.py` | 向量不可用时自动降级为关键词检索 |
-| Agent 会话记忆 | 已启用 | SQLite 持久化会话、消息、结构化报告和工具轨迹；最近消息可按配置注入 Kimi |
+| Qdrant 检索 | `backend/tracelens/qdrant_retrieval.py` + `retrieval.py` | 向量不可用时自动降级为关键词检索 |
+| Agent 会话记忆 | 已启用 | SQLite 持久化会话、消息、结构化报告和工具轨迹；最近消息可按配置注入 DeepSeek |
 | MySQL / Redis / RocketMQ | 暂未引入 | 适合多用户、异步任务和生产部署，当前本地版不依赖 |
 
 学习参考项目时，建议优先关注这条数据流：
@@ -214,11 +214,11 @@ curl http://127.0.0.1:9090/api/metrics | jq
 
 每次 /api/ask 都会创建或复用 session_id。系统会把用户问题、Agent 回答、结构化报告和工具调用轨迹写入 data/agent.sqlite3，重启后仍可通过 /api/videos/{video_id}/memory 恢复。前端会自动携带当前会话 ID，并展示该视频最近一次会话。
 
-由于历史消息发送给 Kimi 属于数据外发，配置项 KIMI_SEND_SESSION_HISTORY 控制是否将最近 12 条消息加入模型上下文。backend/.env.example 默认关闭；将它设为 true 后才会把历史消息发送给 Kimi，设为 false 时历史仍保存在本地，但仅用于页面恢复和审计。
+由于历史消息发送给 DeepSeek 属于数据外发，配置项 DEEPSEEK_SEND_SESSION_HISTORY 控制是否将最近 12 条消息加入模型上下文。backend/.env.example 默认关闭；将它设为 true 后才会把历史消息发送给 DeepSeek，设为 false 时历史仍保存在本地，但仅用于页面恢复和审计。
 
 ## 📊 项目统计
 
-- **代码组织**：`backend/seeit/` 按 Agent、检索、媒体、存储和 API 职责拆分
+- **代码组织**：`backend/tracelens/` 按 Agent、检索、媒体、存储和 API 职责拆分
 - **测试覆盖**：14 个回归测试，100% 通过
 - **依赖库数**：10+ 主要库（FastAPI、LangGraph、Qdrant 等）
 - **前端组件**：Vue 3 单页应用，实时交互式 UI
@@ -230,11 +230,11 @@ video-evidence-agent/
 ├── backend/
 │   ├── app/
 │   │   ├── __init__.py
-│   │   └── main.py              # 兼容入口，实际应用在 seeit/
-│   ├── seeit/
+│   │   └── main.py              # 兼容入口，实际应用在 tracelens/
+│   ├── tracelens/
 │   │   ├── main.py              # ASGI 入口
 │   │   ├── api.py               # FastAPI 路由和应用组装
-│   │   ├── agent.py             # AgentToolbox、Kimi 和引用校验
+│   │   ├── agent.py             # AgentToolbox、DeepSeek 和引用校验
 │   │   ├── agent_graph.py       # 旧版 LangGraph 兼容工作流
 │   │   ├── agent_structured.py # Planner -> Retriever -> Verifier -> Writer -> Critic
 │   │   ├── retrieval.py         # 关键词、向量和 Qdrant 检索
@@ -270,7 +270,7 @@ video-evidence-agent/
 
 ### 添加新工具
 
-在 `backend/seeit/agent.py` 的 `AgentToolbox` 中定义新工具：
+在 `backend/tracelens/agent.py` 的 `AgentToolbox` 中定义新工具：
 
 ```python
 AVAILABLE_TOOLS = {
@@ -285,7 +285,7 @@ def my_tool_function(param1: str, param2: str) -> dict[str, Any]:
     return {"result": "..."}
 ```
 
-然后在 Kimi 工具循环或 `backend/seeit/agent_graph.py` 的节点中调用它。
+然后在 DeepSeek 工具循环或 `backend/tracelens/agent_graph.py` 的节点中调用它。
 
 ### 自定义 Agent 节点
 

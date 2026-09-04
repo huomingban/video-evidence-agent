@@ -53,6 +53,7 @@ def get_connection() -> sqlite3.Connection:
             session_id TEXT PRIMARY KEY,
             video_id TEXT,
             title TEXT,
+            summary TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
@@ -81,8 +82,31 @@ def get_connection() -> sqlite3.Connection:
             support_level TEXT NOT NULL,
             report_json TEXT NOT NULL,
             trace_json TEXT,
+            report_type TEXT NOT NULL DEFAULT 'INITIAL',
+            parent_report_id INTEGER,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS media_tasks (
+            task_id TEXT PRIMARY KEY,
+            video_id TEXT NOT NULL,
+            task_type TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'QUEUED',
+            progress_current INTEGER NOT NULL DEFAULT 0,
+            progress_total INTEGER NOT NULL DEFAULT 0,
+            progress_message TEXT,
+            result_json TEXT,
+            error TEXT,
+            question TEXT,
+            session_id TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            started_at TEXT,
+            finished_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -90,6 +114,11 @@ def get_connection() -> sqlite3.Connection:
     ensure_column(connection, "evidence", "source", "TEXT NOT NULL DEFAULT 'ASR'")
     ensure_column(connection, "videos", "ocr_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
     ensure_column(connection, "agent_sessions", "title", "TEXT")
+    ensure_column(connection, "agent_sessions", "summary", "TEXT")
+    ensure_column(connection, "agent_reports", "report_type", "TEXT NOT NULL DEFAULT 'INITIAL'")
+    ensure_column(connection, "agent_reports", "parent_report_id", "INTEGER")
+    ensure_column(connection, "media_tasks", "question", "TEXT")
+    ensure_column(connection, "media_tasks", "session_id", "TEXT")
     return connection
 
 
@@ -114,11 +143,13 @@ def init_db() -> None:
                 session_id TEXT PRIMARY KEY,
                 video_id TEXT,
                 title TEXT,
+                summary TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        ensure_column(connection, "agent_sessions", "summary", "TEXT")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS agent_messages (
@@ -142,11 +173,74 @@ def init_db() -> None:
                 support_level TEXT NOT NULL,
                 report_json TEXT NOT NULL,
                 trace_json TEXT,
+                report_type TEXT NOT NULL DEFAULT 'INITIAL',
+                parent_report_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_tasks (
+                task_id TEXT PRIMARY KEY,
+                video_id TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'QUEUED',
+                progress_current INTEGER NOT NULL DEFAULT 0,
+                progress_total INTEGER NOT NULL DEFAULT 0,
+                progress_message TEXT,
+                result_json TEXT,
+            error TEXT,
+            question TEXT,
+            session_id TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+
+def create_media_task(
+    video_id: str,
+    task_type: str,
+    *,
+    question: str | None = None,
+    session_id: str | None = None,
+) -> str:
+    task_id = uuid.uuid4().hex
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT INTO media_tasks(task_id, video_id, task_type, question, session_id) VALUES (?, ?, ?, ?, ?)",
+            (task_id, video_id, task_type.upper(), question, session_id),
+        )
+    return task_id
+
+
+def update_media_task(task_id: str, **values: Any) -> None:
+    allowed = {
+        "state", "progress_current", "progress_total", "progress_message",
+        "result_json", "error", "started_at", "finished_at",
+    }
+    values = {key: value for key, value in values.items() if key in allowed}
+    if not values:
+        return
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with get_connection() as connection:
+        connection.execute(
+            f"UPDATE media_tasks SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?",
+            (*values.values(), task_id),
+        )
+
+
+def get_media_task(task_id: str) -> dict[str, Any] | None:
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM media_tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def file_sha256(path: Path) -> str:
@@ -158,7 +252,7 @@ def file_sha256(path: Path) -> str:
 
 
 def register_legacy_videos() -> None:
-    """Register uploads created before the videos resource table existed."""
+    """Reconcile upload directories with the persistent video resource table."""
     if not UPLOADS_DIR.is_dir():
         return
     with get_connection() as connection:
@@ -166,13 +260,9 @@ def register_legacy_videos() -> None:
             if not video_dir.is_dir() or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", video_dir.name):
                 continue
             existing = connection.execute(
-                "SELECT 1 FROM videos WHERE video_id = ?", (video_dir.name,)
+                "SELECT video_id, filename, stored_path, content_hash FROM videos WHERE video_id = ?",
+                (video_dir.name,),
             ).fetchone()
-            if existing:
-                continue
-            evidence_count = connection.execute(
-                "SELECT COUNT(*) FROM evidence WHERE video_id = ?", (video_dir.name,)
-            ).fetchone()[0]
             candidates = [
                 path for path in video_dir.iterdir()
                 if path.is_file() and path.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpeg", ".mpg"}
@@ -180,24 +270,38 @@ def register_legacy_videos() -> None:
             if not candidates:
                 continue
             path = max(candidates, key=lambda item: item.stat().st_mtime)
-            connection.execute(
-                """
-                INSERT INTO videos(video_id, filename, stored_path, content_hash, status, transcript_text)
-                VALUES (?, ?, ?, ?, 'COMPLETED', ?)
-                """,
-                (
-                    video_dir.name,
-                    path.name,
-                    str(path),
-                    file_sha256(path),
-                    "\n".join(
-                        row[0] for row in connection.execute(
-                            "SELECT text FROM evidence WHERE video_id = ? ORDER BY start_seconds, id",
-                            (video_dir.name,),
-                        ).fetchall()
-                    ) if evidence_count else None,
-                ),
-            )
+            digest = file_sha256(path)
+            if existing is None:
+                evidence_count = connection.execute(
+                    "SELECT COUNT(*) FROM evidence WHERE video_id = ?", (video_dir.name,)
+                ).fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO videos(video_id, filename, stored_path, content_hash, status, transcript_text)
+                    VALUES (?, ?, ?, ?, 'COMPLETED', ?)
+                    """,
+                    (
+                        video_dir.name,
+                        path.name,
+                        str(path),
+                        digest,
+                        "\n".join(
+                            row[0] for row in connection.execute(
+                                "SELECT text FROM evidence WHERE video_id = ? ORDER BY start_seconds, id",
+                                (video_dir.name,),
+                            ).fetchall()
+                        ) if evidence_count else None,
+                    ),
+                )
+            elif (
+                existing["filename"] != path.name
+                or existing["stored_path"] != str(path)
+                or existing["content_hash"] != digest
+            ):
+                connection.execute(
+                    "UPDATE videos SET filename = ?, stored_path = ?, content_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE video_id = ?",
+                    (path.name, str(path), digest, video_dir.name),
+                )
 def get_or_create_session(session_id: str | None, video_id: str | None) -> str:
     if session_id and not re.fullmatch(r"[A-Za-z0-9-]{8,100}", session_id):
         raise HTTPException(status_code=422, detail="invalid session_id")
@@ -229,9 +333,36 @@ def get_session_history(session_id: str, limit: int = 12) -> list[dict[str, str]
     return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
 
 
-def save_agent_turn(session_id: str, question: str, result: dict[str, Any]) -> None:
-    answer = str(result.get("answer") or "").strip()
+def get_latest_agent_result(session_id: str) -> dict[str, Any] | None:
     with get_connection() as connection:
+        row = connection.execute(
+            "SELECT report_json FROM agent_reports WHERE session_id = ? AND report_type = 'INITIAL' "
+            "ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    if not row or not row["report_json"]:
+        return None
+    try:
+        value = json.loads(row["report_json"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def save_agent_turn(session_id: str, question: str, result: dict[str, Any]) -> None:
+    # Every submitted question gets a durable record, including safe refusals
+    # and provider failures. The UI can then explain what happened and users
+    # can remove the record explicitly.
+    answer = str(result.get("answer") or result.get("error") or "未生成回答").strip()
+    report_type = "FOLLOW_UP" if result.get("kind") == "follow_up" else "INITIAL"
+    with get_connection() as connection:
+        parent = None
+        if report_type == "FOLLOW_UP":
+            parent = connection.execute(
+                "SELECT id FROM agent_reports WHERE session_id = ? AND report_type = 'INITIAL' "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
         connection.executemany(
             "INSERT INTO agent_messages(session_id, role, content) VALUES (?, ?, ?)",
             [(session_id, "user", question), (session_id, "assistant", answer)],
@@ -239,8 +370,9 @@ def save_agent_turn(session_id: str, question: str, result: dict[str, Any]) -> N
         connection.execute(
             """
             INSERT INTO agent_reports(
-                session_id, question, answer, answerable, support_level, report_json, trace_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                session_id, question, answer, answerable, support_level, report_json, trace_json,
+                report_type, parent_report_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -250,9 +382,33 @@ def save_agent_turn(session_id: str, question: str, result: dict[str, Any]) -> N
                 str(result.get("support_level") or ("DIRECT" if result.get("grounded") else "INSUFFICIENT")),
                 json.dumps(result, ensure_ascii=False),
                 json.dumps(result.get("tool_trace") or result.get("trace") or [], ensure_ascii=False),
+                report_type,
+                parent["id"] if parent else None,
             ),
         )
         connection.execute(
             "UPDATE agent_sessions SET title = COALESCE(title, ?), updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
             (question[:80], session_id),
         )
+        recent = connection.execute(
+            "SELECT role, content FROM agent_messages WHERE session_id = ? ORDER BY id DESC LIMIT 12",
+            (session_id,),
+        ).fetchall()
+        recent.reverse()
+        summary = "\n".join(
+            f"{item['role']}: {str(item['content'])[:1200]}"
+            for item in recent
+        )[-6000:]
+        connection.execute(
+            "UPDATE agent_sessions SET summary = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+            (summary, session_id),
+        )
+
+
+def get_session_summary(session_id: str) -> str:
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT summary FROM agent_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    return str(row["summary"] or "") if row else ""

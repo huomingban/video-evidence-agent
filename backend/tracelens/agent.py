@@ -1,4 +1,4 @@
-"""Agent tools, Kimi orchestration, reports, and citation validation."""
+"""Agent tools, DeepSeek orchestration, reports, and citation validation."""
 from __future__ import annotations
 import json
 import os
@@ -13,11 +13,13 @@ try:
     import httpx
 except Exception:
     httpx = None
-from .config import UPLOADS_DIR, env_flag, kimi_settings, logger
+from .config import UPLOADS_DIR, env_flag, llm_settings, logger
 from .models import Evidence
 from .retrieval import (
     format_timestamp,
     load_video_evidence,
+    parse_time_hints,
+    plan_evidence_requirements,
     public_evidence,
     search_evidence,
     search_qdrant,
@@ -27,28 +29,49 @@ from .runtime_retrieval import build_runtime_retriever
 from .storage import get_connection
 
 
-def kimi_failure_result(question: str, error: Exception | str) -> dict[str, Any]:
-    """Return a useful Kimi error without exposing credentials or huge traces."""
+def deepseek_failure_result(question: str, error: Exception | str) -> dict[str, Any]:
+    """Return a useful provider error without exposing credentials or huge traces."""
     detail = str(error).replace("\n", " ").strip()
-    settings = kimi_settings()
+    settings = llm_settings()
     if settings.get("api_key"):
         detail = detail.replace(settings["api_key"], "<redacted>")
     detail = re.sub(r"\b(?:sk|ak)-[A-Za-z0-9_-]{8,}\b", "<redacted>", detail)
     detail = re.sub(r"\borg-[A-Za-z0-9_-]{8,}\b", "<org-redacted>", detail)
-    detail = detail[:500] or "unknown Kimi request error"
+    detail = detail[:500] or "unknown DeepSeek request error"
     return {
         "question": question,
-        "answer": f"Kimi 请求失败：{detail}",
+        "answer": f"DeepSeek 请求失败：{detail}",
         "grounded": False,
         "citations": [],
-        "provider": "Kimi error",
+        "provider": "DeepSeek error",
         "error": detail,
-        "trace": [f"Kimi request failed: {detail}"],
+        "trace": [f"DeepSeek request failed: {detail}"],
     }
 
 
-def _create_kimi_completion(client: Any, **kwargs: Any) -> Any:
-    """Retry rate-limited requests using the provider's requested delay."""
+# Preserve the old function for downstream callers while provider names move to DeepSeek.
+kimi_failure_result = deepseek_failure_result
+
+
+def _create_llm_completion(client: Any, **kwargs: Any) -> Any:
+    """Create a completion with DeepSeek-compatible Thinking parameters."""
+    settings = llm_settings()
+    # The OpenAI SDK does not accept ``thinking`` as a top-level argument.
+    # DeepSeek expects it inside extra_body, and Thinking cannot be combined
+    # with the forced tool_choice used by the structured Agent. In the normal
+    # workflow we therefore omit Thinking entirely.
+    extra_body = dict(kwargs.get("extra_body") or {})
+    extra_body.pop("thinking", None)
+    thinking_enabled = bool(settings.get("thinking_enabled")) and not kwargs.get("tool_choice")
+    if kwargs.get("tool_choice") == "auto":
+        kwargs.pop("tool_choice", None)
+    if thinking_enabled:
+        extra_body["thinking"] = {"type": "enabled"}
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+    else:
+        kwargs.pop("extra_body", None)
+    kwargs.pop("thinking", None)
     for attempt in range(4):
         try:
             return client.chat.completions.create(**kwargs)
@@ -61,12 +84,34 @@ def _create_kimi_completion(client: Any, **kwargs: Any) -> Any:
             time.sleep(max(1, min(delay + 1, 30)))
 
 
+_create_kimi_completion = _create_llm_completion
+
+
 def is_summary_goal(goal: str) -> bool:
+    """Return whether a question asks for a video-level synthesis.
+
+    Summary questions are intentionally detected by meaning rather than only
+    by words such as ``总结``. Natural questions like ``视频主要讲了什么``
+    must use the representative timeline path as well.
+    """
     normalized = re.sub(r"\s+", "", str(goal)).lower()
-    return bool(re.search(
+    patterns = (
+        # Canonical UTF-8 forms. Older revisions stored several patterns as
+        # mojibake, causing real Chinese summary questions to miss this path.
+        r"(?:这(?:个|段)?视频)?(?:主要|大致)?(?:在)?(?:讲|说|介绍|讨论)了?(?:些)?什么",
+        r"(?:这(?:个|段)?视频)?(?:的)?(?:主要|核心)?内容(?:是|有什么|包括)?什么?",
+        r"(?:总结|概括|综述|梳理).{0,10}(?:这(?:个|段)?视频|视频内容|主要内容|核心观点)",
+        r"(?:这(?:个|段)?视频|视频内容).{0,8}(?:总结|概括|梳理)",
+        r"提炼(?:这(?:个|段)?视频)?(?:的)?(?:核心|主要)(?:观点|内容|结论)",
+        r"(?:summari[sz]e|overview|main\s+(?:content|point|topic))",
+        r"(?:这个|该|本|这段)?视频(?:最)?(?:主要)?(?:在)?(?:讲|说|介绍|讨论|分析)(?:了)?(?:些)?什么",
+        r"(?:这个|该|本|这段)?视频(?:的)?(?:最)?(?:主要|核心)?内容(?:是|有)?什么",
+        r"(?:总结|概括|综述|梳理|理解).{0,10}(?:视频|主要内容|核心内容|核心观点)",
+        r"(?:生成|整理)(?:一份)?(?:学习笔记|视频摘要)",
+        r"提炼(?:视频)?(?:核心观点|主要观点|关键结论)",
         r"总结|概括|综述|梳理|核心内容|主要内容|关键观点|学习笔记|视频摘要|summari[sz]e|overview",
-        normalized,
-    ))
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
 
 
 def build_agent_plan(goal: str) -> dict[str, Any]:
@@ -125,10 +170,12 @@ class AgentToolbox:
         self.evidence = load_video_evidence(video_id)
         self.retriever = build_runtime_retriever(video_id)
         self._trace: list[dict[str, Any]] = []
+        self._goal_coverage_plan: dict[str, Any] | None = None
+        self._goal_evidence_sufficiency: dict[str, Any] | None = None
 
     def plan(self) -> dict[str, Any]:
         normalized = re.sub(r"\s+", "", self.question)
-        is_summary = any(marker in normalized for marker in ("总结", "概括", "主要内容", "核心观点", "讲了什么"))
+        is_summary = is_summary_goal(self.question)
         is_time_question = bool(re.search(r"\d{1,3}:\d{2}|\d+秒|什么时候|何时|哪里", normalized))
         if is_summary:
             intent = "STRUCTURED_SUMMARY"
@@ -279,31 +326,119 @@ class AgentToolbox:
         return self.schemas()
 
     def prefetch_goal_evidence(self, goal: str, top_k: int = 8) -> dict[str, Any]:
-        result = self._search({"query": goal, "top_k": top_k})
+        """Run deterministic coverage retrieval once and cache its result."""
+        coverage_plan = plan_evidence_requirements(goal)
+        requirements = coverage_plan.get("requirements", [])[:6]
+        merged: dict[str, dict[str, Any]] = {}
+        requirement_status: list[dict[str, Any]] = []
+
+        def add(item: dict[str, Any], requirement_id: str, rank: int) -> None:
+            key = str(item.get("segmentId") or item.get("evidenceId") or item.get("evidence_id"))
+            if not key or key in {"None", "0"}:
+                return
+            current = merged.setdefault(key, dict(item))
+            ids = current.setdefault("coverageRequirementIds", [])
+            if requirement_id not in ids:
+                ids.append(requirement_id)
+            reasons = current.setdefault("coverageSelectionReasons", [])
+            reason = "REQUIREMENT_PRIMARY" if rank == 1 else "REQUIREMENT_CANDIDATE"
+            if reason not in reasons:
+                reasons.append(reason)
+
+        for index, requirement in enumerate(requirements, start=1):
+            requirement_id = str(requirement.get("requirementId") or f"R{index}")
+            query = str(requirement.get("query") or goal)
+            # Search each source independently so OCR cannot be crowded out by ASR.
+            source_matches: list[dict[str, Any]] = []
+            for source in ("OCR", "ASR"):
+                source_result = self._search({"query": query, "top_k": max(2, top_k // 2), "sources": [source]})
+                source_matches.extend(dict(item) for item in source_result.get("matches", []))
+            by_key = {
+                str(item.get("segmentId") or item.get("evidenceId") or item.get("evidence_id")): item
+                for item in source_matches
+            }
+            candidates = sorted(
+                by_key.values(),
+                key=lambda item: (
+                    0 if str(item.get("source", "")).upper() == "OCR" else 1,
+                    int(item.get("startMs", 0)),
+                ),
+            )[:top_k]
+            for rank, item in enumerate(candidates, start=1):
+                add(item, requirement_id, rank)
+            requirement_status.append({
+                "requirementId": requirement_id,
+                "query": query,
+                "candidateCount": len(candidates),
+                "satisfied": bool(candidates),
+                "candidateEvidenceIds": [
+                    str(item.get("evidenceId", item.get("evidence_id"))) for item in candidates
+                ],
+            })
+
+        matches = sorted(
+            merged.values(),
+            key=lambda item: (
+                0 if str(item.get("source", "")).upper() == "OCR" else 1,
+                int(item.get("startMs", 0)),
+                str(item.get("segmentId", "")),
+            ),
+        )
+        visible_limit = max(top_k, 12)
+        ocr = [item for item in matches if str(item.get("source", "")).upper() == "OCR"]
+        asr = [item for item in matches if str(item.get("source", "")).upper() != "OCR"]
+        ocr_quota = min(len(ocr), max(1, (visible_limit * 3 + 4) // 5))
+        matches = (ocr[:ocr_quota] + asr)[:visible_limit]
+        result = {
+            "ok": True,
+            "query": goal,
+            "matches": matches,
+            "coveragePlan": coverage_plan,
+            "evidenceSufficiency": {
+                "decision": "SUFFICIENT_CANDIDATES" if all(item["satisfied"] for item in requirement_status) else "PARTIAL_EVIDENCE",
+                "fullyCovered": bool(requirement_status) and all(item["satisfied"] for item in requirement_status),
+                "requirementCount": len(requirement_status),
+                "satisfiedRequirementCount": sum(bool(item["satisfied"]) for item in requirement_status),
+                "requirements": requirement_status,
+            },
+        }
         matches = result.get("matches", [])
+        self._goal_coverage_plan = dict(result.get("coveragePlan") or {}) or None
+        self._goal_evidence_sufficiency = dict(result.get("evidenceSufficiency") or {}) or None
         return {
             **result,
-            "coveragePlan": {
-                "strategy": "HYBRID_RETRIEVAL",
-                "query": goal,
-                "requirementCount": 1,
-            },
-            "evidenceSufficiency": {
-                "decision": "SUFFICIENT_CANDIDATES" if matches else "INSUFFICIENT_EVIDENCE",
-                "fullyCovered": bool(matches),
-                "requirements": [{
-                    "requirementId": "R1",
-                    "satisfied": bool(matches),
-                    "candidateEvidenceIds": [
-                        str(item.get("evidence_id", item.get("evidenceId")))
-                        for item in matches
-                    ],
-                }],
-            },
         }
 
     def goal_evidence_sufficiency(self) -> dict[str, Any] | None:
-        return None
+        return json.loads(json.dumps(self._goal_evidence_sufficiency, ensure_ascii=False)) if self._goal_evidence_sufficiency else None
+
+    def evidence_for_question(self, question: str, max_segments: int = 18) -> list[dict[str, Any]]:
+        """Select a small question-specific context for follow-up answers."""
+        if is_summary_goal(question):
+            return self._overview({"max_segments": max_segments}).get("segments", [])
+        result = self._search({"query": question, "top_k": min(8, max_segments)})
+        meaningful = [
+            dict(item) for item in result.get("matches", [])
+            if float(item.get("score", 0.0)) > 0
+            or str(item.get("selectionReason", "")) == "TIME_ANCHOR"
+        ]
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for match in meaningful[:4]:
+            window = self._window({
+                "timestamp_ms": int(match.get("startMs", 0)),
+                "before_ms": 15000,
+                "after_ms": 15000,
+            })
+            for item in window.get("segments", []):
+                key = str(item.get("segmentId"))
+                if key in seen:
+                    continue
+                selected.append(item)
+                seen.add(key)
+                if len(selected) >= max_segments:
+                    return selected
+        return selected or meaningful[:max_segments]
 
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -380,31 +515,41 @@ class AgentToolbox:
             str(source).upper() for source in (arguments.get("sources") or [])
             if str(source).upper() in {"ASR", "OCR"}
         }
-        matches = self.retriever(query, max(count * 4, 20) if requested_sources else count)
-        if requested_sources:
-            matches = [item for item in matches if item.source.upper() in requested_sources]
-            # A hybrid retriever may return enough ASR hits to fill its limit
-            # before OCR is considered. Complete an explicit source request
-            # from the source-specific timeline pool.
-            source_pool = [
-                item for item in self.evidence
-                if item.source.upper() in requested_sources
-            ]
-            query_tokens = tokenize(query)
-            source_pool.sort(
-                key=lambda item: (
-                    -len(query_tokens & tokenize(item.text)),
-                    item.start_seconds,
-                    item.id,
-                )
-            )
-            seen_ids = {item.id for item in matches}
-            matches.extend(item for item in source_pool if item.id not in seen_ids)
-        matches = matches[:count]
+        retrieval = self.retriever.search(
+            query,
+            top_k=max(count * 3, 12),
+            sources=sorted(requested_sources) if requested_sources else None,
+        )
+        # Search each source independently when both modalities are requested.
+        # This is the important part that prevents a long ASR transcript from
+        # filling the candidate window before slide text is considered.
+        if requested_sources == {"ASR", "OCR"}:
+            source_items: dict[str, dict[str, Any]] = {}
+            for source in ("OCR", "ASR"):
+                source_result = self.retriever.search(query, top_k=max(count * 2, 12), sources=[source])
+                for item in source_result.get("matches", []):
+                    source_items.setdefault(str(item.get("segmentId") or item.get("evidenceId")), dict(item))
+            time_hints = parse_time_hints(query)
+            ranked = sorted(source_items.values(), key=lambda item: (
+                min((abs(int(item.get("startMs", 0)) - hint) for hint in time_hints), default=10**12),
+                0 if str(item.get("source", "")).upper() == "OCR" else 1,
+                -float(item.get("score", 0.0)),
+                int(item.get("startMs", 0)),
+            ))
+            ocr = [item for item in ranked if str(item.get("source", "")).upper() == "OCR"]
+            asr = [item for item in ranked if str(item.get("source", "")).upper() != "OCR"]
+            ocr_quota = min(len(ocr), max(1, (count * 3 + 4) // 5))
+            matches = (ocr[:ocr_quota] + asr)[:count]
+        else:
+            matches = [dict(item) for item in retrieval.get("matches", [])][:count]
         return {
             "ok": True,
             "query": query,
-            "matches": [self._structured_evidence(item) for item in matches],
+            "matches": matches,
+            "retrievalMode": retrieval.get("retrievalMode", "COVERAGE_AWARE"),
+            "coveragePlan": retrieval.get("coveragePlan"),
+            "evidenceSufficiency": retrieval.get("evidenceSufficiency"),
+            "timeHintsMs": retrieval.get("timeHintsMs", []),
         }
 
     def _window(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -482,6 +627,19 @@ class AgentToolbox:
         selected = [by_id[item_id] for item_id in ids if item_id in by_id]
         invalid_ids = [item_id for item_id in ids if item_id not in by_id]
         coverage = verify_coverage_tool(self.question, selected)
+        # The structured Verifier already checked requirement-level entailment.
+        # Do not let the legacy whole-question token ratio reject a valid
+        # timestamp answer merely because the question contains words such as
+        # "around" or "what" that cannot appear in the transcript.
+        if answerable and selected and (
+            parse_time_hints(self.question) or is_summary_goal(self.question)
+        ):
+            coverage["adequate"] = True
+            coverage["reason"] = (
+                "Representative timeline evidence covers the video-level synthesis"
+                if is_summary_goal(self.question)
+                else "Timestamp requirement is covered by selected evidence"
+            )
         if not final_answer:
             return {"ok": False, "accepted": False, "error": "final_answer 不能为空"}
         if answerable and (not selected or invalid_ids or not coverage["adequate"]):
@@ -629,7 +787,7 @@ def run_kimi_agent(question: str, video_id: str | None, history: list[dict[str, 
     if not kimi_is_configured():
         return None
 
-    settings = kimi_settings()
+    settings = llm_settings()
     toolbox = AgentToolbox(video_id, question)
     plan = toolbox.plan()
     messages: list[dict[str, Any]] = [
@@ -643,7 +801,7 @@ def run_kimi_agent(question: str, video_id: str | None, history: list[dict[str, 
             ),
         },
     ]
-    if env_flag("KIMI_SEND_SESSION_HISTORY", False) and history:
+    if env_flag("DEEPSEEK_SEND_SESSION_HISTORY", env_flag("KIMI_SEND_SESSION_HISTORY", False)) and history:
         messages.extend(
             {
                 "role": item["role"],
@@ -673,18 +831,17 @@ def run_kimi_agent(question: str, video_id: str | None, history: list[dict[str, 
             api_key=settings["api_key"],
             base_url=settings["base_url"],
             timeout=settings["timeout"],
-            max_retries=1,
+            max_retries=0,
             http_client=http_client,
         )
         max_steps = max(2, min(int(os.getenv("AGENT_MAX_TOOL_STEPS", "8")), 12))
         for step in range(max_steps):
-            response = _create_kimi_completion(client,
+            response = _create_llm_completion(client,
                 model=settings["model"],
                 temperature=settings["temperature"],
                 messages=messages,
                 tools=toolbox.schemas(),
                 tool_choice="auto",
-                **({"extra_body": {"thinking": {"type": "enabled" if settings["thinking"] else "disabled"}}}),
             )
             message = response.choices[0].message
             tool_calls = list(_message_value(message, "tool_calls", []) or [])
@@ -708,11 +865,11 @@ def run_kimi_agent(question: str, video_id: str | None, history: list[dict[str, 
                             "answer": result["final_answer"],
                             "grounded": bool(result["answerable"]),
                             "citations": result["citations"],
-                            "provider": "Kimi",
+                            "provider": "DeepSeek",
                             "agent_plan": plan,
                             "support_level": result["support_level"],
                             "trace": [
-                                f"Agent step {step + 1}: Kimi selected {item['tool']}"
+                                f"Agent step {step + 1}: DeepSeek selected {item['tool']}"
                                 for item in toolbox.trace()
                             ],
                             "tool_trace": toolbox.trace(),
@@ -736,7 +893,7 @@ def run_kimi_agent(question: str, video_id: str | None, history: list[dict[str, 
                         "answer": result["final_answer"],
                         "grounded": bool(result["answerable"]),
                         "citations": result["citations"],
-                        "provider": "Kimi",
+                        "provider": "DeepSeek",
                         "agent_plan": plan,
                         "support_level": result["support_level"],
                         "trace": [
@@ -751,9 +908,9 @@ def run_kimi_agent(question: str, video_id: str | None, history: list[dict[str, 
                     "content": "请继续调用证据工具，并通过 generate_report 提交最终报告，不要只输出普通文本。",
                 },
             ])
-        raise RuntimeError("Kimi Agent exceeded its tool-step budget without an accepted report")
+        raise RuntimeError("DeepSeek Agent exceeded its tool-step budget without an accepted report")
     except Exception as error:
-        logger.exception("Kimi Agent execution failed")
+        logger.exception("DeepSeek Agent execution failed")
         return kimi_failure_result(question, error)
 
 
@@ -761,7 +918,7 @@ def generate_kimi_answer(question: str, evidence: list[Evidence]) -> tuple[str, 
     if not kimi_is_configured():
         return None
 
-    settings = kimi_settings()
+    settings = llm_settings()
     context = [
         {
             "evidence_id": item.id,
@@ -790,10 +947,10 @@ def generate_kimi_answer(question: str, evidence: list[Evidence]) -> tuple[str, 
             api_key=settings["api_key"],
             base_url=settings["base_url"],
             timeout=settings["timeout"],
-            max_retries=1,
+            max_retries=0,
             http_client=http_client,
         )
-        response = _create_kimi_completion(client,
+        response = _create_llm_completion(client,
             model=settings["model"],
             temperature=settings["temperature"],
             messages=[
@@ -803,19 +960,18 @@ def generate_kimi_answer(question: str, evidence: list[Evidence]) -> tuple[str, 
                 },
                 {"role": "user", "content": prompt},
             ],
-            **({"extra_body": {"thinking": {"type": "enabled" if settings["thinking"] else "disabled"}}}),
         )
         content = response.choices[0].message.content or ""
         parsed = parse_kimi_json(content)
         if not parsed or not isinstance(parsed.get("answer"), str):
-            raise ValueError("Kimi returned an invalid JSON answer")
+            raise ValueError("DeepSeek returned an invalid JSON answer")
         ids = parsed.get("citation_ids")
         if not isinstance(ids, list) or not ids:
-            raise ValueError("Kimi returned no valid citation ids")
+            raise ValueError("DeepSeek returned no valid citation ids")
         evidence_by_id = {item.id: item for item in evidence}
         selected = [evidence_by_id[int(item_id)] for item_id in ids if str(item_id).isdigit() and int(item_id) in evidence_by_id]
         if not selected:
-            raise ValueError("Kimi cited evidence outside the retrieved set")
+            raise ValueError("DeepSeek cited evidence outside the retrieved set")
         return parsed["answer"].strip(), selected
     except Exception:
         logger.exception("Kimi answer generation failed")
@@ -838,15 +994,15 @@ def answer_from_evidence(question: str, evidence: list[Evidence]) -> dict[str, A
             "answer": answer,
             "grounded": True,
             "citations": evidence_citations(cited_evidence),
-            "provider": "Kimi",
+            "provider": "DeepSeek",
         }
 
     if kimi_is_configured():
         return {
-            "answer": "Kimi 暂时不可用，未生成未经验证的回答。请检查 API Key、模型名称和网络连接。",
+            "answer": "DeepSeek 暂时不可用，未生成未经验证的回答。请检查 API Key、模型名称和网络连接。",
             "grounded": False,
             "citations": [],
-            "provider": "Kimi error",
+            "provider": "DeepSeek error",
         }
 
     answer = "根据检索到的视频证据，相关内容包括：" + "；".join(
@@ -859,18 +1015,21 @@ def answer_from_evidence(question: str, evidence: list[Evidence]) -> dict[str, A
         "provider": "local fallback",
     }
     
-def kimi_is_configured() -> bool:
-    settings = kimi_settings()
+def deepseek_is_configured() -> bool:
+    settings = llm_settings()
     return bool(OpenAI is not None and settings["enabled"] and settings["api_key"])
 
 
-class KimiStructuredProvider:
-    """Small OpenAI-compatible adapter used by the structured LangGraph."""
+kimi_is_configured = deepseek_is_configured
+
+
+class DeepSeekStructuredProvider:
+    """OpenAI-compatible DeepSeek adapter used by the structured LangGraph."""
 
     def __init__(self) -> None:
         if OpenAI is None:
             raise RuntimeError("openai package is not installed")
-        settings = kimi_settings()
+        settings = llm_settings()
         http_client = None
         if httpx is not None:
             http_client = httpx.Client(
@@ -882,7 +1041,7 @@ class KimiStructuredProvider:
             api_key=settings["api_key"],
             base_url=settings["base_url"],
             timeout=settings["timeout"],
-            max_retries=1,
+            max_retries=0,
             http_client=http_client,
         )
         self._settings = settings
@@ -909,7 +1068,7 @@ class KimiStructuredProvider:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-        tool_choice: dict[str, Any] | None = None,
+        tool_choice: dict[str, Any] | str | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self._settings["model"],
@@ -919,30 +1078,90 @@ class KimiStructuredProvider:
         }
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
-        kwargs["extra_body"] = {
-            "thinking": {"type": "enabled" if self._settings["thinking"] else "disabled"}
-        }
         # The OpenAI-compatible SDK returns a ChatCompletion object.  The
         # structured graph consumes a plain message mapping, so normalize the
         # SDK object at this boundary instead of leaking it into the graph.
-        response = _create_kimi_completion(self._client, **kwargs)
+        try:
+            response = _create_llm_completion(self._client, **kwargs)
+        except Exception as error:
+            unsupported_choice = tool_choice is not None and (
+                "does not support this tool_choice" in str(error)
+                or re.search(r"unsupported.*tool_choice", str(error), flags=re.I) is not None
+            )
+            if not unsupported_choice:
+                raise
+            # Some DeepSeek thinking configurations accept tools but reject
+            # a forced function choice. Let the model choose the only schema.
+            kwargs.pop("tool_choice", None)
+            response = _create_llm_completion(self._client, **kwargs)
         choices = _message_value(response, "choices", []) or []
         if not choices:
-            raise RuntimeError("Kimi response did not contain choices")
+            raise RuntimeError("DeepSeek response did not contain choices")
         return self._message_dict(_message_value(choices[0], "message", {}))
 
+    def follow_up(
+        self,
+        report: str,
+        question: str,
+        *,
+        history: list[dict[str, str]] | None = None,
+        memory_summary: str = "",
+        evidence_timeline: str = "",
+    ) -> str:
+        """Answer a follow-up as prose without rebuilding a structured report."""
+        messages: list[dict[str, Any]] = [{
+            "role": "system",
+            "content": (
+                "你是视频证据问答 Agent 的追问模块。只根据已有报告、会话上下文和本次检索到的证据回答。"
+                "输出一段简洁自然的中文，不要输出 JSON、标题、证据列表或时间轴。"
+                "如果证据不足，明确说明无法从视频确定，不要补充外部知识。"
+            ),
+        }]
+        messages.append({
+            "role": "user",
+            "content": (
+                f"已有初次报告：\n{report[:10000]}\n\n"
+                f"本轮相关视频证据：\n{evidence_timeline[:10000]}\n\n"
+                f"会话记忆摘要：\n{memory_summary[:3000]}"
+            ),
+        })
+        if history:
+            messages.extend(
+                {"role": item["role"], "content": item["content"]}
+                for item in history[-20:]
+                if item.get("role") in {"user", "assistant"} and item.get("content", "").strip()
+            )
+        messages.append({
+            "role": "user",
+            "content": f"追问：{question}",
+        })
+        response = _create_llm_completion(
+            self._client,
+            model=self._settings["model"],
+            temperature=self._settings["temperature"],
+            messages=messages,
+        )
+        choices = _message_value(response, "choices", []) or []
+        if not choices:
+            raise RuntimeError("DeepSeek follow-up response did not contain choices")
+        content = _message_value(choices[0], "message", {})
+        answer = str(_message_value(content, "content", "") or "").strip()
+        if not answer:
+            raise RuntimeError("DeepSeek follow-up returned an empty answer")
+        return answer
 
-def run_structured_kimi_agent(
+
+def run_structured_deepseek_agent(
     question: str,
     video_id: str | None,
 ) -> dict[str, Any] | None:
     """Run the reference-style five-stage Agent when explicitly enabled."""
-    if not kimi_is_configured():
+    if not deepseek_is_configured():
         return None
     try:
         from .agent_structured import run_structured_evidence_agent
 
-        provider = KimiStructuredProvider()
+        provider = DeepSeekStructuredProvider()
         toolbox = AgentToolbox(video_id, question)
         result = run_structured_evidence_agent(provider, toolbox, question)
         report = result.get("report") or result
@@ -967,13 +1186,30 @@ def run_structured_kimi_agent(
                     "text": item.get("content", ""),
                     "source": item.get("source", "ASR"),
                 }
-                for item in report_evidence
+                for item in report_evidence[:9]
                 if int(item.get(
                     "dbEvidenceId",
                     item.get("evidence_id", item.get("id", 0)),
                 ) or 0) > 0
             ],
-            "provider": "Kimi structured Agent",
+            "provider": "DeepSeek structured Agent",
+            "kind": "initial_report",
+            "report": {
+                "answerable": bool(report_answerable),
+                "title": str(report.get("title") or "视频分析报告"),
+                "finalAnswer": str(report_answer or result.get("answer") or ""),
+                "conclusions": list(report.get("conclusions") or []),
+                "evidence": [
+                    {
+                        "evidence_id": int(item.get("dbEvidenceId", item.get("evidence_id", item.get("id", 0))) or 0),
+                        "timestamp": format_timestamp(float(item.get("timestampMs", item.get("startMs", 0))) / 1000),
+                        "text": item.get("content", item.get("text", "")),
+                        "source": item.get("source", "ASR"),
+                    }
+                    for item in report_evidence[:9]
+                ],
+                "suggestions": list(report.get("suggestions") or []),
+            },
             "support_level": "DIRECT" if report_answerable else "INSUFFICIENT",
             "agent_graph": result.get("agentGraph"),
             "trace": [
@@ -983,5 +1219,49 @@ def run_structured_kimi_agent(
             "tool_trace": toolbox.trace(),
         }
     except Exception as error:
-        logger.exception("Structured Kimi Agent execution failed")
-        return kimi_failure_result(question, error)
+        logger.exception("Structured DeepSeek Agent execution failed")
+        return deepseek_failure_result(question, error)
+
+
+KimiStructuredProvider = DeepSeekStructuredProvider
+run_structured_kimi_agent = run_structured_deepseek_agent
+
+
+def run_deepseek_follow_up(
+    question: str,
+    video_id: str | None,
+    previous_report: dict[str, Any],
+    history: list[dict[str, str]] | None = None,
+    memory_summary: str = "",
+) -> dict[str, Any] | None:
+    if not deepseek_is_configured():
+        return None
+    try:
+        toolbox = AgentToolbox(video_id, question)
+        selected = toolbox.evidence_for_question(question, max_segments=18)
+        evidence_context = "\n".join(
+            f"[{item.get('source', 'ASR')}] {item.get('timestamp', '')} {item.get('content', item.get('text', ''))}"
+            for item in selected
+        )
+        provider = DeepSeekStructuredProvider()
+        answer = provider.follow_up(
+            str(previous_report.get("answer") or previous_report.get("finalAnswer") or ""),
+            question,
+            history=history,
+            memory_summary=memory_summary,
+            evidence_timeline=evidence_context,
+        )
+        return {
+            "question": question,
+            "answer": answer,
+            "grounded": bool(selected),
+            "citations": [],
+            "provider": "DeepSeek follow-up",
+            "kind": "follow_up",
+            "support_level": "DIRECT" if selected else "INSUFFICIENT",
+            "trace": ["Follow-up retrieval: selected question-specific evidence", "Follow-up writer: prose answer"],
+            "tool_trace": toolbox.trace(),
+        }
+    except Exception as error:
+        logger.exception("DeepSeek follow-up failed")
+        return deepseek_failure_result(question, error)

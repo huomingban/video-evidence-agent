@@ -300,7 +300,7 @@ def _run_ocr_subprocess(directory: Path) -> dict[str, object]:
     project_python = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
     python_executable = str(project_python) if project_python.is_file() else sys.executable
     command = [
-        python_executable, "-m", "seeit.ocr_runner",
+        python_executable, "-m", "tracelens.ocr_runner",
         "--input-dir", str(directory), "--output", str(output_path),
     ]
     child_env = os.environ.copy()

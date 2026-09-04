@@ -22,9 +22,27 @@ def extract_goal_timestamps_ms(goal: str) -> list[int]:
         occupied.append((start, end))
         candidates.append((start, milliseconds))
 
+    for match in re.finditer(r"(?<!\d)(\d{1,2}):(\d{2}):(\d{2})(?!\d)", goal):
+        add(match, (int(match.group(1)) * 3600 + int(match.group(2)) * 60 + int(match.group(3))) * 1000)
     for match in re.finditer(r"(?<!\d)(\d{1,3}):(\d{2})(?!\d)", goal):
         add(match, (int(match.group(1)) * 60 + int(match.group(2))) * 1000)
     for match in re.finditer(r"(\d+(?:\.\d+)?)\s*(?:秒|s)\b", goal, flags=re.I):
+        add(match, int(float(match.group(1)) * 1000))
+    for match in re.finditer(
+        r"(?:(?:\u7b2c|\u7ea6|\u5927\u7ea6|\u5728|around|about|at)\s*)?"
+        r"(\d+(?:\.\d+)?)\s*(?:\u5206\u949f|\u5206|minutes?|mins?)"
+        r"(?:\s*(?:\u5de6\u53f3|\u9644\u8fd1|around|about))?",
+        goal,
+        flags=re.I,
+    ):
+        add(match, int(float(match.group(1)) * 60 * 1000))
+    for match in re.finditer(
+        r"(?:(?:\u7b2c|\u7ea6|\u5927\u7ea6|\u5728|around|about|at)\s*)?"
+        r"(\d+(?:\.\d+)?)\s*(?:\u79d2|seconds?|secs?)"
+        r"(?:\s*(?:\u5de6\u53f3|\u9644\u8fd1|around|about))?",
+        goal,
+        flags=re.I,
+    ):
         add(match, int(float(match.group(1)) * 1000))
     return [value for _, value in sorted(candidates)][:5]
 

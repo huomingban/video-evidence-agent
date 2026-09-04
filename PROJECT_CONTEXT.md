@@ -1,7 +1,7 @@
 # Project Context
 
 ## Goal
-Build a resume-ready Agent project for autumn recruitment: a Python-first VideoEvidence Agent inspired by SeeIt AI, but small enough for the student to understand, run, deploy, and explain in interviews.
+Build a resume-ready Agent project for autumn recruitment: a Python-first TraceLens application for traceable video evidence QA, small enough for the student to understand, run, deploy, and explain in interviews.
 
 ## User profile
 - Software engineering student at Tianjin University of Technology.
@@ -19,10 +19,10 @@ Build a resume-ready Agent project for autumn recruitment: a Python-first VideoE
 - Avoid spending the first month on Java, every Agent framework, advanced distributed infrastructure, or blind LeetCode grinding. Add complexity only after the core demo works.
 
 ## Confirmed direction
-- Project name: VideoEvidence Agent.
+- Project name: TraceLens.
 - Product: traceable long-video evidence Q&A system.
 - Flow: video/audio processing -> timestamped transcript evidence -> retrieval -> grounded answer -> citations -> refusal when evidence is insufficient.
-- Do not copy SeeIt AI wholesale. Learn its architecture and implement a smaller original version.
+- Keep the implementation original while borrowing general ideas from evidence-grounded agent systems.
 - Keep Vue frontend as a later workbench so the user's existing frontend skills remain valuable.
 
 ## Planned stack

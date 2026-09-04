@@ -3,6 +3,9 @@
 from .retrieval import (
     ensure_qdrant_collection,
     get_qdrant_client,
+    parse_time_hints,
+    evidence_window,
+    search_timeline,
     search_qdrant,
     sync_evidence_to_qdrant,
 )
@@ -10,6 +13,9 @@ from .retrieval import (
 __all__ = [
     "ensure_qdrant_collection",
     "get_qdrant_client",
+    "parse_time_hints",
+    "evidence_window",
+    "search_timeline",
     "search_qdrant",
     "sync_evidence_to_qdrant",
 ]
