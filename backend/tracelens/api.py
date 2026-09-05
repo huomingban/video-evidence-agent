@@ -10,10 +10,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials
 from starlette.concurrency import run_in_threadpool
 from . import agent as agent_module
+from .auth import bearer, create_access_token, current_user, enforce_login_rate_limit, hash_password, optional_user, require_authenticated_user, revoke_access_token, verify_password
+from .bilibili import BilibiliImportError, download_bilibili_video, fetch_bilibili_metadata, normalize_bvid
 from .agent import (
     AgentToolbox,
     answer_from_evidence,
@@ -29,7 +32,7 @@ from .config import env_flag, logger
 from . import ocr_runner
 from .ocr_runner import extract_ocr_evidence, extract_transcript_from_video, merge_transcript_chunks, resolve_ffmpeg_path
 from .media import validate_video_filename, validate_video_id
-from .models import AskIn, DemoSeedIn, EvidenceIn
+from .models import AskIn, AuthIn, BilibiliIn, DemoSeedIn, EvidenceIn
 from .retrieval import (
     _QDRANT_CLIENT,
     ensure_qdrant_collection,
@@ -44,9 +47,13 @@ from .storage import (
     DB_PATH,
     UPLOADS_DIR,
     create_media_task,
+    create_user,
+    claim_video,
     get_connection,
     get_latest_agent_result,
     get_media_task,
+    get_user_by_username,
+    user_owns_video,
     get_or_create_session,
     get_session_history,
     get_session_summary,
@@ -54,6 +61,7 @@ from .storage import (
     register_legacy_videos,
     save_agent_turn,
     update_media_task,
+    update_media_task as persist_media_task,
 )
 from .tasks import submit_task
 
@@ -407,8 +415,132 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "tracelens"}
 
 
+@app.post("/api/auth/register")
+def register(payload: AuthIn, request: Request) -> dict[str, Any]:
+    enforce_login_rate_limit(request, f"register:{payload.username}")
+    try:
+        user = create_user(payload.username, hash_password(payload.password))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {"user": user, "access_token": create_access_token(user), "token_type": "bearer"}
+
+
+@app.post("/api/auth/login")
+def login(payload: AuthIn, request: Request) -> dict[str, Any]:
+    enforce_login_rate_limit(request, payload.username)
+    user = get_user_by_username(payload.username)
+    if user is None or not verify_password(payload.password, str(user.get("password_hash", ""))):
+        raise HTTPException(status_code=401, detail="invalid username or password")
+    return {"user": {"id": user["id"], "username": user["username"], "role": user["role"]},
+            "access_token": create_access_token(user), "token_type": "bearer"}
+
+
+@app.post("/api/auth/logout")
+def logout(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict[str, bool]:
+    if credentials is not None:
+        try:
+            revoke_access_token(credentials.credentials)
+        except HTTPException:
+            pass
+    return {"logged_out": True}
+
+
+@app.get("/api/auth/me")
+def me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return {"id": user["id"], "username": user["username"], "role": user["role"]}
+
+
+def _authorize_video(video_id: str | None, user: dict[str, Any] | None) -> None:
+    if not env_flag("AUTH_REQUIRED", True):
+        return
+    if user is None:
+        raise HTTPException(status_code=401, detail="authentication required")
+    if not video_id:
+        return
+    if not user_owns_video(video_id, int(user["id"])):
+        raise HTTPException(status_code=404, detail="video not found")
+
+
+@app.post("/api/media/bilibili/preview")
+def preview_bilibili(payload: BilibiliIn, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
+    require_authenticated_user(user)
+    try:
+        return fetch_bilibili_metadata(payload.bvid)
+    except (ValueError, BilibiliImportError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+def _run_bilibili_import_task(task_id: str, bvid: str) -> dict[str, Any]:
+    update_media_task(
+        task_id,
+        progress_current=1,
+        progress_total=4,
+        progress_message="Downloading Bilibili video",
+    )
+    video_dir = UPLOADS_DIR / bvid
+    downloaded = download_bilibili_video(bvid, video_dir)
+    max_duration = int(os.getenv("BILIBILI_MAX_DURATION_SECONDS", "900"))
+    max_bytes = int(os.getenv("BILIBILI_MAX_FILE_BYTES", str(512 * 1024 * 1024)))
+    if downloaded.duration_seconds > max_duration:
+        downloaded.path.unlink(missing_ok=True)
+        raise ValueError(f"视频时长超过限制（最多 {max_duration} 秒）")
+    if downloaded.path.stat().st_size > max_bytes:
+        downloaded.path.unlink(missing_ok=True)
+        raise ValueError(f"视频文件超过限制（最多 {max_bytes} bytes）")
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT INTO videos(video_id, filename, stored_path, content_hash, status, ocr_status) "
+            "VALUES (?, ?, ?, ?, 'UPLOADED', 'QUEUED') "
+            "ON CONFLICT(video_id) DO UPDATE SET filename=excluded.filename, stored_path=excluded.stored_path, "
+            "content_hash=excluded.content_hash, status=excluded.status, ocr_status=excluded.ocr_status, "
+            "updated_at=CURRENT_TIMESTAMP",
+            (bvid, downloaded.path.name, str(downloaded.path), hashlib.sha256(downloaded.path.read_bytes()).hexdigest()),
+        )
+    result = _run_transcription_task(
+        task_id,
+        bvid,
+        downloaded.path,
+        downloaded.path.name,
+        progress_offset=1,
+        progress_total=4,
+    )
+    return {"bvid": bvid, "title": downloaded.title, "uploader": downloaded.uploader, **result}
+
+
+@app.post("/api/media/bilibili/import")
+def import_bilibili(payload: BilibiliIn, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
+    require_authenticated_user(user)
+    if not env_flag("BILIBILI_IMPORT_ENABLED", True):
+        raise HTTPException(status_code=503, detail="Bilibili import is disabled")
+    try:
+        bvid = normalize_bvid(payload.bvid)
+        metadata = fetch_bilibili_metadata(bvid)
+    except (ValueError, BilibiliImportError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    max_duration = int(os.getenv("BILIBILI_MAX_DURATION_SECONDS", "900"))
+    if int(metadata.get("durationSeconds") or 0) > max_duration:
+        raise HTTPException(status_code=422, detail=f"视频时长超过限制（最多 {max_duration} 秒）")
+    if env_flag("AUTH_REQUIRED", True):
+        if user is None:
+            raise HTTPException(status_code=401, detail="authentication required")
+        claim_video(bvid, int(user["id"]))
+    task_id = create_media_task(bvid, "BILIBILI_IMPORT")
+    submit_task(task_id, lambda: _run_bilibili_import_task(task_id, bvid))
+    return {"bvid": bvid, "metadata": metadata, "status": "queued", "task_id": task_id}
+
+
+@app.get("/api/media/bilibili/import-status")
+def bilibili_import_status(task_id: str, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
+    task = get_media_task(task_id)
+    if task is None or str(task.get("task_type", "")).upper() != "BILIBILI_IMPORT":
+        raise HTTPException(status_code=404, detail="bilibili import task not found")
+    _authorize_video(str(task.get("video_id") or ""), user)
+    return get_task(task_id, user=user)
+
+
 @app.get("/api/evidence")
-def list_evidence(video_id: str | None = None) -> dict[str, Any]:
+def list_evidence(video_id: str | None = None, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
+    _authorize_video(video_id, user)
     with get_connection() as connection:
         rows = connection.execute(
             "SELECT id, video_id, start_seconds, end_seconds, text, source FROM evidence "
@@ -424,7 +556,9 @@ def search_evidence_api(
     video_id: str | None = None,
     top_k: int = 8,
     sources: str | None = None,
+    user: dict[str, Any] | None = Depends(optional_user),
 ) -> dict[str, Any]:
+    _authorize_video(video_id, user)
     source_list = [item.strip().upper() for item in (sources or "").split(",") if item.strip()]
     return search_timeline(query, video_id, top_k, source_list)
 
@@ -435,7 +569,9 @@ def evidence_window_api(
     timestamp_ms: int,
     before_ms: int = 15000,
     after_ms: int = 15000,
+    user: dict[str, Any] | None = Depends(optional_user),
 ) -> dict[str, Any]:
+    _authorize_video(video_id, user)
     return evidence_window(video_id, timestamp_ms, before_ms, after_ms)
 
 
@@ -445,7 +581,11 @@ def evidence_time_hints(query: str) -> dict[str, Any]:
 
 
 @app.post("/api/evidence")
-def create_evidence(payload: EvidenceIn) -> dict[str, Any]:
+def create_evidence(payload: EvidenceIn, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
+    if env_flag("AUTH_REQUIRED", True):
+        if user is None:
+            raise HTTPException(status_code=401, detail="authentication required")
+        claim_video(payload.video_id, int(user["id"]))
     if payload.end_seconds <= payload.start_seconds:
         raise HTTPException(status_code=422, detail="end_seconds must be greater than start_seconds")
     with get_connection() as connection:
@@ -459,7 +599,11 @@ def create_evidence(payload: EvidenceIn) -> dict[str, Any]:
 
 
 @app.post("/api/demo/seed")
-def seed_demo(payload: DemoSeedIn) -> dict[str, Any]:
+def seed_demo(payload: DemoSeedIn, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
+    if env_flag("AUTH_REQUIRED", True):
+        if user is None:
+            raise HTTPException(status_code=401, detail="authentication required")
+        claim_video(payload.video_id, int(user["id"]))
     demo_items = [
         (0, 42, "视频先介绍了项目式学习：先做一个能运行的小项目，再围绕项目补齐知识。"),
         (48, 96, "视频提到面试准备要围绕自己的项目，重点讲清楚数据流、技术选型和故障排查。"),
@@ -467,6 +611,12 @@ def seed_demo(payload: DemoSeedIn) -> dict[str, Any]:
     ]
     with get_connection() as connection:
         connection.execute("DELETE FROM evidence WHERE video_id = ?", (payload.video_id,))
+        connection.execute(
+            "INSERT INTO videos(video_id, filename, stored_path, content_hash, status, ocr_status) "
+            "VALUES (?, ?, '', ?, 'COMPLETED', 'DISABLED') "
+            "ON CONFLICT(video_id) DO UPDATE SET status='COMPLETED', updated_at=CURRENT_TIMESTAMP",
+            (payload.video_id, f"{payload.video_id}.demo.mp4", f"demo:{payload.video_id}"),
+        )
         connection.executemany(
             "INSERT INTO evidence(video_id, start_seconds, end_seconds, text, source) VALUES (?, ?, ?, ?, 'ASR')",
             [(payload.video_id, start, end, text) for start, end, text in demo_items],
@@ -476,19 +626,37 @@ def seed_demo(payload: DemoSeedIn) -> dict[str, Any]:
 
 
 @app.get("/api/videos")
-def list_videos() -> dict[str, Any]:
+def list_videos(user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
+    require_authenticated_user(user)
+    owner_id = int(user["id"]) if env_flag("AUTH_REQUIRED", True) and user else None
     with get_connection() as connection:
         rows = connection.execute(
             "SELECT v.video_id, v.filename, v.content_hash, v.status, v.ocr_status, "
             "v.transcript_text IS NOT NULL AS has_transcript, v.created_at, v.updated_at, "
             "COUNT(e.id) AS evidence_count "
             "FROM videos v LEFT JOIN evidence e ON e.video_id = v.video_id "
+            "WHERE (? IS NULL OR EXISTS (SELECT 1 FROM video_owners o WHERE o.video_id = v.video_id AND o.user_id = ?)) "
             "GROUP BY v.video_id ORDER BY v.updated_at DESC, v.video_id"
-        ).fetchall()
+            , (owner_id, owner_id)).fetchall()
     return {"items": [dict(row) for row in rows]}
 
 
-def _run_transcription_task(task_id: str, video_id: str, stored_path: Path, filename: str) -> dict[str, Any]:
+def _run_transcription_task(
+    task_id: str,
+    video_id: str,
+    stored_path: Path,
+    filename: str,
+    *,
+    progress_offset: int = 0,
+    progress_total: int = 3,
+) -> dict[str, Any]:
+    persist_progress = persist_media_task
+
+    def update_media_task(task_id: str, **values: Any) -> None:
+        values["progress_current"] = int(values.get("progress_current", 0)) + progress_offset
+        values["progress_total"] = progress_total
+        persist_progress(task_id, **values)
+
     update_media_task(task_id, progress_current=1, progress_total=3, progress_message="正在提取音频并转录")
     transcript: list[tuple[float, float, str]] = []
     asr_error = ""
@@ -546,8 +714,13 @@ async def upload_video(
     video_id: str = Form(..., min_length=1),
     file: UploadFile = File(...),
     background: bool = Form(False),
+    user: dict[str, Any] | None = Depends(optional_user),
 ) -> dict[str, Any]:
     video_id = validate_video_id(video_id)
+    if env_flag("AUTH_REQUIRED", True):
+        if user is None:
+            raise HTTPException(status_code=401, detail="authentication required")
+        claim_video(video_id, int(user["id"]))
     if not file.filename:
         raise HTTPException(status_code=400, detail="file name is required")
 
@@ -722,10 +895,11 @@ async def upload_video(
 
 
 @app.get("/api/tasks/{task_id}")
-def get_task(task_id: str) -> dict[str, Any]:
+def get_task(task_id: str, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
     task = get_media_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
+    _authorize_video(str(task.get("video_id") or ""), user)
     if task.get("result_json"):
         try:
             task["result"] = json.loads(task["result_json"])
@@ -736,22 +910,25 @@ def get_task(task_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/analysis/{task_id}")
-def get_analysis_task(task_id: str) -> dict[str, Any]:
+def get_analysis_task(task_id: str, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
     task = get_media_task(task_id)
     if task is None or str(task.get("task_type", "")).upper() != "ANALYSIS":
         raise HTTPException(status_code=404, detail="analysis task not found")
+    _authorize_video(str(task.get("video_id") or ""), user)
     return _analysis_task_response(task)
 
 
 @app.post("/api/analysis")
-def create_analysis(payload: AskIn) -> dict[str, Any]:
+def create_analysis(payload: AskIn, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
     """Reference-style asynchronous entry point for an initial report."""
+    _authorize_video(payload.video_id, user)
     return _create_initial_analysis(payload)
 
 
 @app.delete("/api/videos/{video_id}")
-def delete_video(video_id: str) -> dict[str, Any]:
+def delete_video(video_id: str, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
     video_id = validate_video_id(video_id)
+    _authorize_video(video_id, user)
     video_dir = UPLOADS_DIR / video_id
     with get_connection() as connection:
         row = connection.execute(
@@ -791,8 +968,9 @@ def delete_video(video_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/videos/{video_id}/memory")
-def get_video_memory(video_id: str) -> dict[str, Any]:
+def get_video_memory(video_id: str, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
     video_id = validate_video_id(video_id)
+    _authorize_video(video_id, user)
     with get_connection() as connection:
         sessions = connection.execute(
             "SELECT session_id, title, summary, created_at, updated_at FROM agent_sessions "
@@ -839,8 +1017,9 @@ def get_video_memory(video_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/videos/{video_id}/reports")
-def list_video_reports(video_id: str, limit: int = 20) -> dict[str, Any]:
+def list_video_reports(video_id: str, limit: int = 20, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
     video_id = validate_video_id(video_id)
+    _authorize_video(video_id, user)
     limit = max(1, min(int(limit), 50))
     with get_connection() as connection:
         rows = connection.execute(
@@ -902,17 +1081,22 @@ def list_video_reports(video_id: str, limit: int = 20) -> dict[str, Any]:
 
 
 @app.delete("/api/reports/{report_id}")
-def delete_report(report_id: int) -> dict[str, Any]:
+def delete_report(
+    report_id: int,
+    user: dict[str, Any] | None = Depends(optional_user),
+) -> dict[str, Any]:
     """Delete one report; deleting an initial report also deletes its replies."""
     if report_id <= 0:
         raise HTTPException(status_code=422, detail="invalid report id")
     with get_connection() as connection:
         report = connection.execute(
-            "SELECT id, session_id, question, answer, report_type FROM agent_reports WHERE id = ?",
+            "SELECT r.id, r.session_id, r.question, r.answer, r.report_type, s.video_id "
+            "FROM agent_reports r JOIN agent_sessions s ON s.session_id = r.session_id WHERE r.id = ?",
             (report_id,),
         ).fetchone()
         if report is None:
             raise HTTPException(status_code=404, detail="report not found")
+        _authorize_video(str(report["video_id"] or ""), user)
         is_initial = str(report["report_type"]).upper() == "INITIAL"
         follow_ups = connection.execute(
             "SELECT id, question, answer FROM agent_reports WHERE parent_report_id = ?",
@@ -957,7 +1141,8 @@ def delete_report(report_id: int) -> dict[str, Any]:
 
 
 @app.post("/api/ask")
-def ask(payload: AskIn) -> dict[str, Any]:
+def ask(payload: AskIn, user: dict[str, Any] | None = Depends(optional_user)) -> dict[str, Any]:
+    _authorize_video(payload.video_id, user)
     _validate_analysis_video(payload.video_id)
     session_id = get_or_create_session(payload.session_id, payload.video_id)
     history = get_session_history(session_id)

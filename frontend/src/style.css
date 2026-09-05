@@ -591,10 +591,40 @@ h2 {
 .clean-topbar, .clean-actions, .clean-controls, .clean-heading, .clean-ask-footer { display: flex; }
 .clean-topbar { align-items: flex-start; justify-content: space-between; gap: 28px; margin-bottom: 24px; }
 .clean-actions { align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.account-chip { padding: 7px 11px; border: 1px solid #c9e6df; border-radius: 999px; color: #185d52; background: #e5f3ef; font-size: 13px; font-weight: 700; }
+.auth-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px; background: rgba(23, 34, 42, .46); backdrop-filter: blur(3px); }
+.auth-modal { width: min(100%, 420px); overflow: hidden; border: 1px solid #d8e2e0; border-radius: 8px; background: #fff; box-shadow: 0 22px 60px rgba(23, 33, 41, .26); }
+.auth-modal-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 22px 24px 18px; border-bottom: 1px solid #e4e9e8; }
+.auth-modal-header h2 { margin: 4px 0 0; color: #26343d; font-size: 20px; }
+.icon-button { display: grid; width: 32px; height: 32px; padding: 0; place-items: center; border: 1px solid #d8e0e1; border-radius: 5px; color: #566671; background: #fff; cursor: pointer; font-size: 22px; line-height: 1; }
+.icon-button:hover:not(:disabled) { color: #26343d; background: #f2f6f5; }
+.icon-button:disabled { cursor: not-allowed; opacity: .5; }
+.auth-mode-tabs { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin: 18px 24px 0; padding: 4px; border-radius: 6px; background: #f0f4f3; }
+.auth-mode-tabs button { padding: 8px 10px; border: 0; border-radius: 4px; color: #697881; background: transparent; cursor: pointer; font: inherit; font-size: 13px; font-weight: 700; }
+.auth-mode-tabs button.is-active { color: #175d51; background: #fff; box-shadow: 0 1px 3px rgba(23, 43, 37, .12); }
+.auth-modal-form { display: grid; gap: 7px; padding: 22px 24px 8px; }
+.auth-modal-form label { margin-top: 5px; color: #465761; font-size: 13px; font-weight: 700; }
+.auth-modal-form .text-input { width: 100%; min-height: 40px; margin: 0; }
+.auth-modal-form .text-input.has-error { border-color: #cb655b; background: #fff8f7; }
+.field-error, .auth-error { margin: 0; color: #a33c34; font-size: 12px; line-height: 1.45; }
+.auth-error { margin-top: 8px; padding: 9px 10px; border: 1px solid #efc7c1; border-radius: 5px; background: #fff4f2; }
+.auth-submit { width: 100%; margin-top: 12px; }
+.auth-switch { margin: 10px 0 0; padding: 0 24px 22px; color: #6f7d84; font-size: 13px; text-align: center; }
+.text-button { padding: 0; margin-left: 5px; border: 0; color: #1769e0; background: transparent; cursor: pointer; white-space: nowrap; font: inherit; font-weight: 700; }
+.text-button:disabled { cursor: not-allowed; opacity: .55; }
+.bilibili-copy small, .bilibili-preview span { color: #65727e; font-size: 13px; }
+.bilibili-controls, .bilibili-preview, .bilibili-task { display: flex; align-items: center; gap: 10px; }
+.bilibili-controls .text-input { flex: 1; min-width: 0; margin-bottom: 0; }
+.text-button { border: 0; color: #1769e0; background: transparent; white-space: nowrap; }
 .upload-card { margin-bottom: 16px; padding: 18px 20px; border: 1px solid #d8dee4; border-radius: 8px; background: linear-gradient(135deg, #ffffff 0%, #f6faf9 100%); box-shadow: 0 8px 22px rgba(23, 33, 41, .05); }
 .upload-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
 .upload-card-heading h2 { color: #26343d; font-size: 18px; }
 .upload-card-caption { color: #74818a; font-size: 12px; }
+.ingestion-tabs { display: flex; gap: 18px; margin: 20px 0 14px; border-bottom: 1px solid #e3e8ec; }
+.ingestion-tab { padding: 0 0 9px; border: 0; color: #87939d; background: transparent; font-size: 13px; font-weight: 700; }
+.ingestion-tab { appearance: none; cursor: pointer; font-family: inherit; }
+.ingestion-tab:focus-visible { outline: 2px solid #547a72; outline-offset: 2px; }
+.ingestion-tab.is-active { border-bottom: 2px solid #1769e0; color: #1769e0; }
 .upload-card-body { display: flex; align-items: stretch; gap: 10px; }
 .upload-dropzone { display: flex; align-items: center; flex: 1; gap: 12px; min-width: 0; padding: 12px 14px; border: 1px dashed #aebfc0; border-radius: 7px; color: #31434a; background: rgba(255,255,255,.78); cursor: pointer; transition: border-color .15s, background .15s; }
 .upload-dropzone:hover, .upload-dropzone.has-file { border-color: #3b967b; background: #f0faf6; }
@@ -604,6 +634,17 @@ h2 {
 .upload-dropzone small { color: #74818a; font-size: 11px; }
 .upload-icon { display: grid; place-items: center; width: 32px; height: 32px; flex: 0 0 auto; border-radius: 50%; color: #287b63; background: #e2f4ed; font-size: 22px; font-weight: 700; line-height: 1; }
 .upload-submit { align-self: stretch; min-width: 116px; }
+.bilibili-import { display: grid; gap: 12px; margin-top: 18px; padding-top: 18px; border-top: 1px solid #e3e8ec; }
+.bilibili-copy { display: grid; gap: 3px; }
+.bilibili-copy strong { color: #263743; }
+.bilibili-preview, .bilibili-task { justify-content: space-between; padding: 12px 14px; border: 1px solid #dce8e5; border-radius: 6px; background: #f7fbfa; }
+.bilibili-preview div { display: grid; gap: 3px; min-width: 0; }
+.bilibili-preview strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bilibili-task { color: #53657d; font-size: 12px; }
+.bilibili-progress-card { border-color: #cbdcf2; background: #f7fbff; }
+.bilibili-progress-card.is-complete { border-color: #b8dece; background: #f4fbf7; }
+.bilibili-progress-card.is-failed { border-color: #efc6c0; background: #fff6f4; }
+.bilibili-progress-card.is-failed .progress-track span { background: #c95e53; }
 .task-progress-card { margin-top: 13px; padding: 12px 14px; border: 1px solid #d9e8e2; border-radius: 6px; background: #fbfefd; }
 .upload-progress-card { border-color: #cbdcf2; background: #f7fbff; }
 .transcription-progress-card { border-color: #d9e8e2; background: #fbfefd; }
@@ -675,6 +716,10 @@ h2 {
 @media (max-width: 760px) {
   .clean-topbar { flex-direction: column; }
   .clean-actions { justify-content: flex-start; }
+  .auth-backdrop { align-items: end; padding: 12px; }
+  .auth-modal { width: 100%; }
+  .bilibili-controls { align-items: stretch; }
+  .bilibili-preview { align-items: flex-start; flex-direction: column; }
   .upload-card-body { align-items: stretch; flex-direction: column; }
   .upload-submit { width: 100%; }
   .upload-card-heading { align-items: flex-start; flex-direction: column; gap: 4px; }

@@ -22,6 +22,27 @@ def get_connection() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'USER',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS video_owners (
+            video_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS evidence (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             video_id TEXT NOT NULL,
@@ -126,6 +147,27 @@ def init_db() -> None:
     with get_connection() as connection:
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'USER',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS video_owners (
+                video_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS evidence (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 video_id TEXT NOT NULL,
@@ -136,6 +178,7 @@ def init_db() -> None:
             )
         """
         )
+
         ensure_column(connection, "evidence", "source", "TEXT NOT NULL DEFAULT 'ASR'")
         connection.execute(
             """
@@ -201,6 +244,53 @@ def init_db() -> None:
             )
             """
         )
+
+
+def create_user(username: str, password_hash: str) -> dict[str, Any]:
+    with get_connection() as connection:
+        try:
+            cursor = connection.execute(
+                "INSERT INTO users(username, password_hash) VALUES (?, ?)",
+                (username, password_hash),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("username already exists") from error
+        return {"id": cursor.lastrowid, "username": username, "role": "USER", "is_active": True}
+
+
+def get_user_by_username(username: str) -> dict[str, Any] | None:
+    with get_connection() as connection:
+        row = connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["is_active"] = bool(result.get("is_active"))
+    return result
+
+
+def get_user_by_id(user_id: int) -> dict[str, Any] | None:
+    with get_connection() as connection:
+        row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["is_active"] = bool(result.get("is_active"))
+    return result
+
+
+def claim_video(video_id: str, user_id: int) -> None:
+    with get_connection() as connection:
+        row = connection.execute("SELECT user_id FROM video_owners WHERE video_id = ?", (video_id,)).fetchone()
+        if row is None:
+            connection.execute("INSERT INTO video_owners(video_id, user_id) VALUES (?, ?)", (video_id, user_id))
+        elif int(row["user_id"]) != int(user_id):
+            raise HTTPException(status_code=404, detail="video not found")
+
+
+def user_owns_video(video_id: str, user_id: int) -> bool:
+    with get_connection() as connection:
+        row = connection.execute("SELECT user_id FROM video_owners WHERE video_id = ?", (video_id,)).fetchone()
+    return row is not None and int(row["user_id"]) == int(user_id)
 
 
 def create_media_task(

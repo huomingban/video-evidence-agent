@@ -32,9 +32,6 @@
 ## 🚀 快速开始
 
 ### 环境要求
-- Python 3.12+
-- Node.js 16+
-- FFmpeg（Windows: `winget install Gyan.FFmpeg`）
 
 ### 后端启动
 
@@ -72,6 +69,9 @@ npm run dev
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/api/health` | GET | 健康检查 |
+| `/api/auth/register` | POST | 注册用户并返回 JWT |
+| `/api/auth/login` | POST | 登录并返回 JWT |
+| `/api/auth/me` | GET | 获取当前用户 |
 | `/api/evidence` | GET/POST | 证据列表和创建 |
 | `/api/ask` | POST | 提问（执行 Agent 工作流） |
 | `/api/videos/upload` | POST | 上传视频（自动转录） |
@@ -199,7 +199,10 @@ curl http://127.0.0.1:9090/api/metrics | jq
 | `generate_report` | Agent 工具的结构化报告提交 | 后端校验引用 ID 和证据覆盖后才接受 |
 | Qdrant 检索 | `backend/tracelens/qdrant_retrieval.py` + `retrieval.py` | 向量不可用时自动降级为关键词检索 |
 | Agent 会话记忆 | 已启用 | SQLite 持久化会话、消息、结构化报告和工具轨迹；最近消息可按配置注入 DeepSeek |
-| MySQL / Redis / RocketMQ | 暂未引入 | 适合多用户、异步任务和生产部署，当前本地版不依赖 |
+| Bilibili 导入 | `backend/tracelens/bilibili.py` + `/api/media/bilibili/*` | BV 预览、异步下载、复用现有 ASR/OCR 流程 |
+| MCP Server | `backend/tracelens/mcp_server.py` | Streamable HTTP/stdio，暴露视频、证据和导入工具 |
+| Skills | `skills/*/SKILL.md` | 课程笔记、操作指南、会议复盘、证据审计 |
+| MySQL / Redis / RocketMQ | `docker-compose.infra.yml` | 已提供基础设施与连接配置；当前存储仍默认 SQLite |
 
 学习参考项目时，建议优先关注这条数据流：
 
@@ -208,7 +211,29 @@ curl http://127.0.0.1:9090/api/metrics | jq
      -> 模型提交报告 -> 后端校验引用 -> 返回答案
 ```
 
-当前项目已经实现参考项目中的核心 Agent 数据流，并继续补齐工程化能力：会话持久化、报告留档、工具轨迹和资源生命周期管理。SQLite 适合当前单机开发和简历演示；如果后续部署多实例，再将会话与任务存储迁移到 MySQL/Redis 等服务。
+当前项目已经实现参考项目中的核心 Agent 数据流，并继续补齐工程化能力：会话持久化、报告留档、工具轨迹、Bilibili 导入、MCP 工具层和可选 RocketMQ Worker。SQLite 仍是当前默认存储；`docker-compose.infra.yml` 可启动 MySQL（数据库名 `tracelens`）、Redis、RocketMQ 和 Qdrant，但 MySQL 存储迁移仍是下一阶段的生产化工作。
+
+### Bilibili、MCP 与基础设施
+
+```powershell
+# 启动 MySQL、Redis、RocketMQ 和 Qdrant
+docker compose -f docker-compose.infra.yml up -d
+
+# API
+cd backend
+pip install -r requirements.txt
+uvicorn tracelens.main:app --reload --port 9090
+
+# MCP（另开终端）
+python -m tracelens.mcp_server --transport streamable-http --host 127.0.0.1 --port 8001
+
+# 启用 RocketMQ 后再启动 Worker
+python -m tracelens.worker
+```
+
+`POST /api/media/bilibili/preview` 用于校验 BV 号并读取元数据；`POST /api/media/bilibili/import` 返回异步任务 ID，使用 `GET /api/media/bilibili/import-status?task_id=...` 查询导入和转录状态。首次使用 Bilibili 需要安装 `yt-dlp`，并确保本机可用 FFmpeg。
+
+登录接口使用 PBKDF2 密码哈希和 HS256 JWT。默认启用 `AUTH_REQUIRED=true`；开发时如需使用无账户演示数据，可在本地 `.env` 显式设置为 `false`。JWT 包含唯一 `jti`，退出登录会撤销令牌；Redis 可用时负责令牌撤销和登录限流，不可用时限流退回单进程内存。部署前必须替换 `JWT_SECRET`。
 
 ### 会话记忆
 

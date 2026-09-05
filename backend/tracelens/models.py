@@ -24,6 +24,15 @@ class DemoSeedIn(BaseModel):
     video_id: str = Field(default="demo-video", min_length=1, max_length=200)
 
 
+class BilibiliIn(BaseModel):
+    bvid: str = Field(min_length=3, max_length=200)
+
+
+class AuthIn(BaseModel):
+    username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_.-]+$")
+    password: str = Field(min_length=8, max_length=128)
+
+
 @dataclass(frozen=True)
 class Evidence:
     id: int

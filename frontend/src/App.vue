@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { api } from "./api";
 
 const videoId = ref("demo-video");
@@ -25,6 +25,52 @@ const reports = ref([]);
 const followUpDrafts = ref({});
 const expandedReportId = ref(null);
 const reportsSection = ref(null);
+const authUser = ref(null);
+const authMode = ref("login");
+const authUsername = ref("");
+const authPassword = ref("");
+const authOpen = ref(false);
+const authLoading = ref(false);
+const authError = ref("");
+const authSubmitted = ref(false);
+const ingestionMode = ref("file");
+const bilibiliBvid = ref("");
+const bilibiliPreview = ref(null);
+const bilibiliTask = ref(null);
+const bilibiliLoading = ref(false);
+const authUsernameError = computed(() => {
+  const value = authUsername.value.trim();
+  if (!value) return "请输入用户名。";
+  if (!/^[A-Za-z0-9_.-]{3,32}$/.test(value)) return "用户名需为 3-32 位字母、数字或 . _ -。";
+  return "";
+});
+const authPasswordError = computed(() => {
+  if (!authPassword.value) return "请输入密码。";
+  if (authPassword.value.length < 8) return "密码至少需要 8 位。";
+  return "";
+});
+const bilibiliProgress = computed(() => {
+  const task = bilibiliTask.value;
+  if (task && typeof task === "object") {
+    const current = Number(task.progress_current ?? task.progressCurrent ?? 0);
+    const total = Number(task.progress_total ?? task.progressTotal ?? 0);
+    if (total > 0) return Math.min(100, Math.round((current / total) * 100));
+    if (task.state === "COMPLETED") return 100;
+    if (task.state === "RUNNING") return 24;
+    return 12;
+  }
+  return bilibiliLoading.value ? 8 : 0;
+});
+const bilibiliProgressLabel = computed(() => {
+  const task = bilibiliTask.value;
+  if (task && typeof task === "object") {
+    if (task.progress_message) return task.progress_message;
+    if (task.state === "COMPLETED") return "Bilibili 视频已导入并完成证据整理";
+    if (task.state === "FAILED") return task.error || "Bilibili 导入失败";
+    return task.state === "QUEUED" ? "正在排队等待导入" : "正在导入 Bilibili 视频";
+  }
+  return bilibiliLoading.value ? "正在提交 Bilibili 导入任务" : "等待导入";
+});
 function reportBody(item) {
   return item?.report?.report || item?.report || {};
 }
@@ -75,7 +121,11 @@ async function loadEvidence() {
   try {
     evidence.value = (await api.listEvidence(videoId.value)).items;
   } catch (error) {
-    message.value = error.message;
+    if (error.status === 401) {
+      openAuth();
+    } else {
+      message.value = error.message;
+    }
   }
 }
 
@@ -86,8 +136,140 @@ async function loadVideos() {
       videoId.value = videos.value[0].video_id;
     }
   } catch (error) {
-    message.value = error.message;
+    if (error.status === 401) {
+      openAuth();
+    } else {
+      message.value = error.message;
+    }
   }
+}
+
+async function loadAuthUser() {
+  if (!window.localStorage.getItem("tracelens_access_token")) return;
+  try {
+    authUser.value = await api.me();
+  } catch {
+    api.logout();
+    authUser.value = null;
+    authOpen.value = true;
+  }
+}
+
+async function submitAuth() {
+  authSubmitted.value = true;
+  authError.value = "";
+  if (authUsernameError.value || authPasswordError.value) return;
+  authLoading.value = true;
+  try {
+    const response = authMode.value === "login"
+      ? await api.login(authUsername.value, authPassword.value)
+      : await api.register(authUsername.value, authPassword.value);
+    authUser.value = response.user;
+    authOpen.value = false;
+    authPassword.value = "";
+    authSubmitted.value = false;
+    message.value = authMode.value === "login" ? "已登录。" : "账户已创建并登录。";
+    await loadVideos();
+  } catch (error) {
+    if (authMode.value === "login" && error.status === 401) {
+      authError.value = "用户名或密码不正确。若尚未注册，请创建账户。";
+    } else if (authMode.value === "register" && error.status === 409) {
+      authError.value = "该用户名已注册，请直接登录。";
+    } else {
+      authError.value = error.message || "暂时无法完成登录，请稍后重试。";
+    }
+  } finally {
+    authLoading.value = false;
+  }
+}
+
+function logout() {
+  api.logout().catch(() => {});
+  authUser.value = null;
+  videos.value = [];
+  evidence.value = [];
+  reports.value = [];
+  message.value = "已退出当前账户。";
+}
+
+function toggleAuthMode() {
+  authMode.value = authMode.value === "login" ? "register" : "login";
+  authError.value = "";
+  authSubmitted.value = false;
+  authPassword.value = "";
+}
+
+function openAuth(mode = "login") {
+  authMode.value = mode;
+  authError.value = "";
+  authSubmitted.value = false;
+  authOpen.value = true;
+}
+
+function closeAuth() {
+  if (!authLoading.value) authOpen.value = false;
+}
+
+function selectIngestionMode(mode) {
+  ingestionMode.value = mode;
+  message.value = "";
+  if (mode === "file") {
+    bilibiliPreview.value = null;
+    bilibiliTask.value = null;
+  } else {
+    selectedFile.value = null;
+    pendingVideoId.value = null;
+  }
+}
+
+async function previewBilibili() {
+  if (!bilibiliBvid.value.trim()) return;
+  bilibiliLoading.value = true;
+  message.value = "正在读取 Bilibili 视频信息...";
+  try {
+    bilibiliPreview.value = await api.previewBilibili(bilibiliBvid.value.trim());
+  } catch (error) {
+    bilibiliPreview.value = null;
+    message.value = error.message;
+  } finally {
+    bilibiliLoading.value = false;
+  }
+}
+
+async function importBilibili() {
+  bilibiliLoading.value = true;
+  bilibiliTask.value = null;
+  message.value = "正在提交 Bilibili 导入任务...";
+  try {
+    const payload = await api.importBilibili(bilibiliBvid.value.trim());
+    bilibiliTask.value = payload.task_id;
+    await waitForBilibiliTask(payload.task_id);
+  } catch (error) {
+    message.value = error.message;
+  } finally {
+    bilibiliLoading.value = false;
+  }
+}
+
+async function waitForBilibiliTask(taskId) {
+  const deadline = Date.now() + 30 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const task = await api.getBilibiliImportStatus(taskId);
+    bilibiliTask.value = task;
+    if (task.state === "COMPLETED") {
+      bilibiliPreview.value = null;
+      bilibiliBvid.value = "";
+      await loadVideos();
+      videoId.value = task.video_id;
+      await loadEvidence();
+      await loadMemory();
+      message.value = "Bilibili 视频已导入，证据时间轴可以使用了。";
+      return;
+    }
+    if (task.state === "FAILED") throw new Error(task.error || "Bilibili 导入失败");
+    await new Promise((resolve) => window.setTimeout(resolve, 900));
+  }
+  throw new Error("Bilibili 导入等待超时，请稍后刷新任务状态。");
 }
 
 async function loadMemory() {
@@ -99,7 +281,11 @@ async function loadMemory() {
     reports.value = (await api.listReports(videoId.value)).items || [];
     expandedReportId.value = null;
   } catch (error) {
-    message.value = error.message;
+    if (error.status === 401) {
+      openAuth();
+    } else {
+      message.value = error.message;
+    }
   }
 }
 
@@ -396,10 +582,25 @@ function formatSeconds(seconds) {
   return `${minutes}:${rest}`;
 }
 
+function handleAuthExpired() {
+  authUser.value = null;
+  authOpen.value = true;
+  videos.value = [];
+  evidence.value = [];
+  reports.value = [];
+  message.value = "登录已失效，请重新登录。";
+}
+
 onMounted(async () => {
+  window.addEventListener("tracelens-auth-expired", handleAuthExpired);
+  await loadAuthUser();
   await loadVideos();
   await loadEvidence();
   await loadMemory();
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("tracelens-auth-expired", handleAuthExpired);
 });
 </script>
 
@@ -572,21 +773,64 @@ onMounted(async () => {
         <h1>TraceLens</h1>
         <p class="subtitle">从视频证据中生成可追溯的分析报告</p>
       </div>
-      <div class="clean-actions"><button class="secondary-button" :disabled="loading" @click="seedDemo">准备演示数据</button></div>
+      <div class="clean-actions">
+        <span v-if="authUser" class="account-chip">{{ authUser.username }}</span>
+        <button v-if="authUser" class="secondary-button" @click="logout">退出</button>
+        <button v-else class="secondary-button" @click="openAuth()">登录 / 注册</button>
+        <button class="secondary-button" :disabled="loading" @click="seedDemo">准备演示数据</button>
+      </div>
     </header>
+
+    <div v-if="authOpen" class="auth-backdrop" @click.self="closeAuth">
+      <section class="auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+        <header class="auth-modal-header">
+          <div><span class="section-label">ACCOUNT</span><h2 id="auth-title">{{ authMode === "login" ? "登录 TraceLens" : "创建账户" }}</h2></div>
+          <button type="button" class="icon-button auth-close" aria-label="关闭登录窗口" :disabled="authLoading" @click="closeAuth">×</button>
+        </header>
+        <div class="auth-mode-tabs" role="tablist" aria-label="账户操作">
+          <button type="button" :class="{ 'is-active': authMode === 'login' }" :aria-selected="authMode === 'login'" @click="authMode !== 'login' && toggleAuthMode()">登录</button>
+          <button type="button" :class="{ 'is-active': authMode === 'register' }" :aria-selected="authMode === 'register'" @click="authMode !== 'register' && toggleAuthMode()">注册</button>
+        </div>
+        <form class="auth-modal-form" novalidate @submit.prevent="submitAuth">
+          <label for="auth-username">用户名</label>
+          <input id="auth-username" v-model.trim="authUsername" class="text-input" :class="{ 'has-error': authSubmitted && authUsernameError }" placeholder="3-32 位字母、数字或 . _ -" autocomplete="username" :disabled="authLoading" @input="authError = ''" />
+          <p v-if="authSubmitted && authUsernameError" class="field-error">{{ authUsernameError }}</p>
+          <label for="auth-password">密码</label>
+          <input id="auth-password" v-model="authPassword" class="text-input" :class="{ 'has-error': authSubmitted && authPasswordError }" type="password" placeholder="至少 8 位" :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'" :disabled="authLoading" @input="authError = ''" />
+          <p v-if="authSubmitted && authPasswordError" class="field-error">{{ authPasswordError }}</p>
+          <p v-if="authError" class="auth-error" role="alert">{{ authError }}</p>
+          <button class="primary-button auth-submit" :disabled="authLoading">{{ authLoading ? "正在处理..." : authMode === "login" ? "登录" : "创建账户" }}</button>
+        </form>
+        <p class="auth-switch">{{ authMode === "login" ? "还没有账户？" : "已经有账户？" }}<button type="button" class="text-button" :disabled="authLoading" @click="toggleAuthMode">{{ authMode === "login" ? "去注册" : "去登录" }}</button></p>
+      </section>
+    </div>
 
     <section class="upload-card">
       <div class="upload-card-heading">
         <div><span class="section-label">VIDEO INGESTION</span><h2>添加一个视频</h2></div>
         <span class="upload-card-caption">上传、转录和 OCR 会在后台持续运行</span>
       </div>
-      <div class="upload-card-body">
+      <div class="ingestion-tabs" role="tablist" aria-label="视频导入方式">
+        <button type="button" :class="['ingestion-tab', { 'is-active': ingestionMode === 'file' }]" :aria-selected="ingestionMode === 'file'" @click="selectIngestionMode('file')">本地文件</button>
+        <button type="button" :class="['ingestion-tab', { 'is-active': ingestionMode === 'bilibili' }]" :aria-selected="ingestionMode === 'bilibili'" @click="selectIngestionMode('bilibili')">Bilibili BV</button>
+      </div>
+      <div v-if="ingestionMode === 'file'" class="upload-card-body">
         <label class="upload-dropzone" :class="{ 'has-file': selectedFile }">
           <input type="file" accept="video/*" @change="handleFileChange" />
           <span class="upload-icon">↑</span>
           <span><strong>{{ selectedFile ? selectedFile.name : "选择视频文件" }}</strong><small>{{ selectedFile ? "已准备好上传，点击右侧按钮开始处理" : "支持 MP4、MOV、MKV、WebM 等常见格式" }}</small></span>
         </label>
         <button class="primary-button upload-submit" :disabled="loading || !selectedFile" @click="uploadVideo">{{ loading ? "处理中..." : "上传并转录" }}</button>
+      </div>
+      <div v-else class="bilibili-import">
+        <div class="bilibili-copy"><strong>从 Bilibili 导入</strong><small>输入 BV 号，先预览元数据，再下载并进入同一套转录与证据流程。</small></div>
+        <div class="bilibili-controls"><input v-model="bilibiliBvid" class="text-input" placeholder="例如 BV1xx411c7mD" @keyup.enter="previewBilibili" /><button class="secondary-button" :disabled="bilibiliLoading || !bilibiliBvid.trim()" @click="previewBilibili">预览</button></div>
+        <div v-if="bilibiliPreview" class="bilibili-preview"><div><strong>{{ bilibiliPreview.title }}</strong><span>{{ bilibiliPreview.uploader || "未知作者" }} · {{ Math.floor((bilibiliPreview.durationSeconds || 0) / 60) }} 分钟</span></div><button class="primary-button" :disabled="bilibiliLoading" @click="importBilibili">确认导入</button></div>
+        <div v-if="bilibiliTask || bilibiliLoading" :class="['task-progress-card', 'bilibili-progress-card', { 'is-failed': bilibiliTask?.state === 'FAILED', 'is-complete': bilibiliTask?.state === 'COMPLETED' }]">
+          <div class="task-progress-top"><strong>{{ bilibiliProgressLabel }}</strong><span>{{ bilibiliProgress }}%</span></div>
+          <div class="progress-track"><span :style="{ width: `${bilibiliProgress}%` }"></span></div>
+          <div class="task-steps"><span :class="{ active: bilibiliProgress >= 12 }">下载视频</span><i></i><span :class="{ active: bilibiliProgress >= 50 }">转录 ASR</span><i></i><span :class="{ active: bilibiliProgress >= 75 }">提取 OCR</span><i></i><span :class="{ active: bilibiliProgress >= 100 }">完成</span></div>
+        </div>
       </div>
       <div v-if="uploadProgress > 0 && loading" class="task-progress-card upload-progress-card">
         <div class="task-progress-top"><strong>{{ uploadProgressLabel }}</strong><span>{{ uploadProgress }}%</span></div>

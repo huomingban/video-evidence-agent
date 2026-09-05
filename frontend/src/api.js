@@ -4,7 +4,13 @@ async function readResponse(response, fallbackMessage) {
   const contentType = response.headers.get("content-type") || "";
   const body = contentType.includes("application/json") ? await response.json() : null;
   if (!response.ok) {
-    throw new Error(body?.detail || `${fallbackMessage}（HTTP ${response.status}）`);
+    if (response.status === 401) {
+      window.localStorage.removeItem("tracelens_access_token");
+      window.dispatchEvent(new CustomEvent("tracelens-auth-expired"));
+    }
+    const error = new Error(body?.detail || `${fallbackMessage}（HTTP ${response.status}）`);
+    error.status = response.status;
+    throw error;
   }
   return body;
 }
@@ -29,13 +35,45 @@ async function fetchWithTimeout(url, options, timeoutMs, fallbackMessage) {
 }
 
 async function request(path, options = {}, timeoutMs = 120000, fallbackMessage = "请求") {
+  const token = window.localStorage.getItem("tracelens_access_token");
   return fetchWithTimeout(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(options.headers || {}),
+    },
     ...options,
   }, timeoutMs, fallbackMessage);
 }
 
 export const api = {
+  register(username, password) {
+    return request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }, 30000, "注册").then((result) => {
+      window.localStorage.setItem("tracelens_access_token", result.access_token);
+      return result;
+    });
+  },
+  login(username, password) {
+    return request("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }, 30000, "登录").then((result) => {
+      window.localStorage.setItem("tracelens_access_token", result.access_token);
+      return result;
+    });
+  },
+  logout() {
+    const token = window.localStorage.getItem("tracelens_access_token");
+    if (!token) return Promise.resolve({ logged_out: true });
+    return request("/api/auth/logout", { method: "POST" }, 10000, "退出登录")
+      .finally(() => window.localStorage.removeItem("tracelens_access_token"));
+  },
+  me() {
+    return request("/api/auth/me", {}, 30000, "读取用户信息");
+  },
   seedDemo(videoId) {
     return request("/api/demo/seed", {
       method: "POST",
@@ -50,6 +88,8 @@ export const api = {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `${API_BASE}/api/videos/upload`);
+      const token = window.localStorage.getItem("tracelens_access_token");
+      if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
       xhr.timeout = 30 * 60 * 1000;
       xhr.upload.onprogress = (event) => {
         if (event.lengthComputable && onProgress) {
@@ -112,5 +152,20 @@ export const api = {
   },
   getAnalysisTask(taskId) {
     return request(`/api/analysis/${encodeURIComponent(taskId)}`, {}, 30000, "Query analysis task");
+  },
+  previewBilibili(bvid) {
+    return request("/api/media/bilibili/preview", {
+      method: "POST",
+      body: JSON.stringify({ bvid }),
+    }, 30000, "Bilibili preview");
+  },
+  importBilibili(bvid) {
+    return request("/api/media/bilibili/import", {
+      method: "POST",
+      body: JSON.stringify({ bvid }),
+    }, 30000, "Bilibili import");
+  },
+  getBilibiliImportStatus(taskId) {
+    return request(`/api/media/bilibili/import-status?task_id=${encodeURIComponent(taskId)}`, {}, 30000, "Bilibili import status");
   },
 };

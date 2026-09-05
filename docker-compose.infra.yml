@@ -1,0 +1,50 @@
+name: tracelens-infra
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: tracelens
+    ports:
+      - "3306:3306"
+    volumes:
+      - tracelens_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.3
+    ports:
+      - "6333:6333"
+    volumes:
+      - tracelens_qdrant:/qdrant/storage
+
+  rocketmq-namesrv:
+    image: apache/rocketmq:4.9.4
+    command: sh mqnamesrv
+    ports:
+      - "9876:9876"
+
+  rocketmq-broker:
+    image: apache/rocketmq:4.9.4
+    command: sh mqbroker -n rocketmq-namesrv:9876
+    environment:
+      NAMESRV_ADDR: rocketmq-namesrv:9876
+    depends_on:
+      - rocketmq-namesrv
+    ports:
+      - "10909:10909"
+      - "10911:10911"
+
+volumes:
+  tracelens_mysql:
+  tracelens_qdrant:

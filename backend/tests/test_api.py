@@ -48,6 +48,30 @@ def test_health() -> None:
     assert response.json()["status"] == "ok"
 
 
+def test_protected_mode_isolates_videos_and_revokes_logout_token(monkeypatch) -> None:
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    import uuid
+    suffix = uuid.uuid4().hex[:8]
+    owner = client.post("/api/auth/register", json={"username": f"owner_{suffix}", "password": "secure-pass-1"})
+    other = client.post("/api/auth/register", json={"username": f"other_{suffix}", "password": "secure-pass-2"})
+    assert owner.status_code == 200
+    assert other.status_code == 200
+    owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+    other_headers = {"Authorization": f"Bearer {other.json()['access_token']}"}
+
+    seeded = client.post("/api/demo/seed", json={"video_id": "private-auth-video"}, headers=owner_headers)
+    assert seeded.status_code == 200
+    assert [item["video_id"] for item in client.get("/api/videos", headers=owner_headers).json()["items"]] == [
+        "private-auth-video"
+    ]
+    assert client.get("/api/videos", headers=other_headers).json()["items"] == []
+    assert client.get("/api/evidence", params={"video_id": "private-auth-video"}, headers=other_headers).status_code == 404
+    assert client.get("/api/videos").status_code == 401
+
+    assert client.post("/api/auth/logout", headers=owner_headers).status_code == 200
+    assert client.get("/api/auth/me", headers=owner_headers).status_code == 401
+
+
 def test_evidence_time_hints_and_window() -> None:
     with __import__("sqlite3").connect(DB_PATH) as connection:
         connection.executemany(
